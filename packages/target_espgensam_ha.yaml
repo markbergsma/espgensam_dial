@@ -1,0 +1,306 @@
+# TRANSPORT: espgensam via Home Assistant.
+#
+# This package is the only file that knows Home Assistant exists or names an entity. It is the
+# seam for the planned UDP-direct transport: a target_espgensam_udp.yaml implementing the same
+# three scripts and writing the same globals drops in here with no change to control.yaml or
+# ui_volume.yaml.
+#
+# The contract it implements (see AGENTS.md):
+#   provides scripts   target_set_volume(db), target_toggle_mute(), target_set_power(on)
+#   writes globals     vol_db, vol_min, vol_max, vol_step, bounds_known, is_muted, sys_power_off
+#   defines            on_volume_reported(reported), derive_state
+#
+# Group presets and volume ducking (no action needed — documented so it is not "fixed" later):
+# when espgensam has groups configured it pushes one at every wake and rediscovery, ducking the
+# volume for the duration (start_group_apply_/finish_group_apply_ in components/gensam/race.cpp).
+# The duck sends a broadcast frame only: it never touches current_volume_db_ and never publishes
+# state, so the dial keeps showing the true target throughout and must NOT try to follow it. A
+# dial write landing mid-push transmits immediately and audibly un-ducks for the remainder of the
+# push; the closing restore then re-sends the real value, so state converges on its own.
+#
+# Only three espgensam entities are used. The 42 per-monitor entities (mute, online, temperature,
+# levels, model/serial/firmware, identify, input routing, crossover, level, delay, calibration
+# bypass) and the group-preset controls are deliberately out of scope — this is a hardware
+# control, not a dashboard. Depending on so few entities is also the best defence against
+# espgensam's still-moving schema: it has added, renamed and removed entities repeatedly, but
+# these three have never changed.
+
+number:
+  # READ-ONLY bridge to espgensam's "Volume (dB)". Writes go through target_set_volume, which
+  # calls the action directly — see the comment there for why.
+  #
+  # Used only to mirror the current value. Bounds come from the three attribute sensors below
+  # rather than from this platform's internal traits: those are not observable from YAML, so a
+  # failure to populate them is indistinguishable from bounds that happen to equal our fallbacks.
+  - platform: homeassistant
+    id: ha_volume
+    entity_id: ${ent_volume}
+    on_value:
+      - script.execute:
+          id: on_volume_reported
+          reported: !lambda "return x;"
+
+sensor:
+  # Volume bounds, read as the number entity's capability attributes. Home Assistant publishes
+  # `min`, `max` and `step` on every `number` entity, so this is the dial's whole reason for not
+  # hardcoding -80/-30: espgensam's committed config, its -25.0 local variant, and any future
+  # change are all picked up automatically.
+  #
+  # bounds_seen tracks which have actually arrived. A "have we received it" flag cannot be
+  # inferred from the values themselves, because real bounds may be identical to the fallbacks —
+  # the deployed controller reports exactly -80/-30/0.5. An earlier version set bounds_known from
+  # a change comparison and consequently never set it at all on that hardware.
+  - platform: homeassistant
+    id: ha_vol_min
+    entity_id: ${ent_volume}
+    attribute: min
+    on_value:
+      - lambda: |-
+          id(vol_min) = x;
+          id(bounds_seen) |= 0x01;
+      - script.execute: bounds_check
+
+  - platform: homeassistant
+    id: ha_vol_max
+    entity_id: ${ent_volume}
+    attribute: max
+    on_value:
+      - lambda: |-
+          id(vol_max) = x;
+          id(bounds_seen) |= 0x02;
+      - script.execute: bounds_check
+
+  - platform: homeassistant
+    id: ha_vol_step
+    entity_id: ${ent_volume}
+    attribute: step
+    on_value:
+      - lambda: |-
+          id(vol_step) = x;
+          id(bounds_seen) |= 0x04;
+      - script.execute: bounds_check
+
+text_sensor:
+  # media_player state: on | off | unavailable | unknown. "off" means system standby.
+  - platform: homeassistant
+    id: ha_media_state
+    entity_id: ${ent_media}
+    on_value:
+      - script.execute: derive_state
+
+  # espgensam's bus health: Active | GLM Active | Discovering | Configuring | Offline.
+  - platform: homeassistant
+    id: ha_bus_status
+    entity_id: ${ent_bus_status}
+    on_value:
+      - script.execute: derive_state
+
+binary_sensor:
+  # Mute is an attribute of the media_player, not an entity of its own — espgensam has no
+  # hub-level mute switch. Reading a boolean attribute is safe because Home Assistant converts
+  # bool attributes to the strings "on"/"off" before sending them (ESPHome's parse_on_off()
+  # accepts only on/off/toggle, not True/False).
+  - platform: homeassistant
+    id: ha_muted
+    entity_id: ${ent_media}
+    attribute: is_volume_muted
+    on_state:
+      - lambda: |-
+          id(is_muted) = x;
+          id(mute_pending_until_ms) = 0;  // confirmed by the source of truth
+      - script.execute: ui_refresh
+
+interval:
+  # Availability is derived from the API link plus the media_player state string, never from the
+  # attribute sensors: when a media_player goes unavailable its attributes simply disappear and
+  # those sensors silently hold their last value.
+  - interval: 1s
+    then:
+      - script.execute: derive_state
+
+  # One-shot wiring check, ~30 s after boot.
+  #
+  # A substitution naming an entity that does not exist in Home Assistant produces no state and
+  # no error: hass.states.get() returns None and the integration simply sends nothing, so the
+  # sensor sits empty forever. Silently losing the bus-status feed would cost the dial its
+  # GLM-lockout protection with no outward sign, so name anything that never reported.
+  - interval: 30s
+    then:
+      - lambda: |-
+          static bool checked = false;
+          if (checked) {
+            return;
+          }
+          checked = true;
+          if (!id(volume_known)) {
+            ESP_LOGW("dial", "no usable value from '%s' - check the entity id", "${ent_volume}");
+          }
+          if (!id(bounds_known)) {
+            ESP_LOGW("dial", "volume bounds incomplete (seen mask 0x%02x: min=%d max=%d step=%d)",
+                     id(bounds_seen), (id(bounds_seen) & 0x01) != 0,
+                     (id(bounds_seen) & 0x02) != 0, (id(bounds_seen) & 0x04) != 0);
+          }
+          if (id(ha_media_state)->state.empty()) {
+            ESP_LOGW("dial", "no state from '%s' - check the entity id", "${ent_media}");
+          }
+          if (id(ha_bus_status)->state.empty()) {
+            ESP_LOGW("dial", "no state from '%s' - check the entity id", "${ent_bus_status}");
+          }
+
+  # Expire an unconfirmed optimistic mute, snapping the screen back to what Home Assistant
+  # actually reports.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(mute_pending_until_ms) == 0 || millis() < id(mute_pending_until_ms)) {
+            return;
+          }
+          id(mute_pending_until_ms) = 0;
+          const bool actual = id(ha_muted)->state;
+          if (actual != id(is_muted)) {
+            ESP_LOGW("dial", "mute not confirmed; reverting to %s", actual ? "on" : "off");
+            id(is_muted) = actual;
+            id(refused_until_ms) = millis() + 700;
+            id(ui_refresh)->execute();
+          }
+
+script:
+  - id: target_set_volume
+    parameters:
+      db: float
+    then:
+      # Deliberately NOT routed through `number.set: id: ha_volume`.
+      #
+      # HomeassistantNumber is constructed with min_value=0 and max_value=0 and only receives the
+      # real bounds once Home Assistant answers its attribute requests. NumberCall::perform()
+      # returns *without* calling control() whenever the value falls outside those traits, so in
+      # the window before the bounds land — or any time they do not, such as after an HA restart —
+      # every negative dB write is discarded with only a WARN line while reads keep working.
+      #
+      # Calling the action directly removes that failure mode and makes all three writes below use
+      # one code path. Clamping is not lost: dial_turned already clamps to [vol_min, vol_max], and
+      # this clamps again defensively.
+      # The finite check is defence in depth — the flusher already refuses to call us with a
+      # value it does not have. std::min/max propagate NAN rather than clamping it away, so
+      # without this a single unparseable report from Home Assistant would come straight back as
+      # `value: "nan"`.
+      - if:
+          condition:
+            lambda: |-
+              if (std::isfinite(db)) {
+                return true;
+              }
+              ESP_LOGW("dial", "refusing to write a non-finite volume");
+              return false;
+          then:
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: ${ent_volume}
+                  value: !lambda |-
+                    const float clamped = std::min(std::max(db, id(vol_min)), id(vol_max));
+                    char buf[12];
+                    snprintf(buf, sizeof(buf), "%.1f", clamped);
+                    return std::string(buf);
+            - lambda: |-
+                ESP_LOGI("dial", "write: volume -> %.1f dB", db);
+
+  # The optimistic flip lives here, not in control.yaml, because only the transport knows how the
+  # change gets confirmed. Volume has the reconciler as a safety net; mute needs its own, because
+  # ha_muted only fires when the attribute actually *changes* — so a write that never lands (the
+  # Home Assistant action permission being the usual cause) would otherwise leave MUTE on screen
+  # forever with nothing to correct it.
+  - id: target_toggle_mute
+    then:
+      - homeassistant.action:
+          action: media_player.volume_mute
+          data:
+            entity_id: ${ent_media}
+            is_volume_muted: !lambda 'return id(is_muted) ? "false" : "true";'
+      - lambda: |-
+          ESP_LOGI("dial", "write: mute -> %s", id(is_muted) ? "off" : "on");
+          id(is_muted) = !id(is_muted);
+          id(mute_pending_until_ms) = millis() + ${reconcile_grace};
+
+  # Parameter is deliberately not called `on`: that collides with an ESPHome/Arduino macro and
+  # fails to compile inside the lambda.
+  - id: target_set_power
+    parameters:
+      power_on: bool
+    then:
+      - homeassistant.action:
+          action: !lambda |-
+            return std::string(power_on ? "media_player.turn_on" : "media_player.turn_off");
+          data:
+            entity_id: ${ent_media}
+      - lambda: |-
+          ESP_LOGI("dial", "write: power -> %s", power_on ? "on" : "off");
+
+  # Promote the three attributes to a usable scale once all of them have arrived and agree.
+  - id: bounds_check
+    mode: restart
+    then:
+      - lambda: |-
+          const bool ok = (id(bounds_seen) == 0x07) &&
+                          std::isfinite(id(vol_min)) && std::isfinite(id(vol_max)) &&
+                          std::isfinite(id(vol_step)) && id(vol_step) > 0.0f &&
+                          (id(vol_max) - id(vol_min)) > 0.1f;
+          if (ok == id(bounds_known)) {
+            return;
+          }
+          id(bounds_known) = ok;
+          if (ok) {
+            ESP_LOGI("dial", "Volume bounds from HA: %.1f..%.1f dB step %.2f",
+                     id(vol_min), id(vol_max), id(vol_step));
+          } else {
+            ESP_LOGW("dial", "Volume bounds no longer usable");
+          }
+      - script.execute: ui_refresh
+
+  # Maps transport state onto the DialState enum. Precedence is defined in include/dial_state.h;
+  # this is the only implementation of it.
+  - id: derive_state
+    mode: restart
+    then:
+      - lambda: |-
+          const std::string media = id(ha_media_state)->state;
+          const std::string bus = id(ha_bus_status)->state;
+
+          // global_api_server is null until the api component has set up.
+          const bool linked = (api::global_api_server != nullptr) &&
+                              api::global_api_server->is_connected();
+          const bool media_known =
+              !media.empty() && media != "unavailable" && media != "unknown";
+
+          // Power state is tracked on its own and never inferred from sys_state below: the two
+          // answer different questions, and conflating them is what made a long press send
+          // turn_off to an already-off system. See include/dial_state.h.
+          if (media_known) {
+            id(sys_power_off) = (media == "off");
+          }
+
+          int next;
+          if (!linked || !media_known) {
+            next = STATE_DISCONNECTED;
+          } else if (bus == "GLM Active") {
+            next = STATE_GLM_LOCKED;
+          } else if (media == "off") {
+            // Above every remaining bus phase, matching espgensam's status LED. Discovery wakes
+            // monitors silently while the system stays off, and a system whose monitors are
+            // unpowered sits at "Offline" forever because espgensam does not retry discovery
+            // while in standby.
+            next = STATE_STANDBY;
+          } else if (bus == "Discovering" || bus == "Configuring") {
+            next = STATE_WAKING;
+          } else if (bus == "Offline") {
+            next = STATE_OFFLINE;
+          } else {
+            next = STATE_ACTIVE;
+          }
+
+          if (next != id(sys_state)) {
+            ESP_LOGI("dial", "state %d -> %d (media='%s' bus='%s')",
+                     id(sys_state), next, media.c_str(), bus.c_str());
+            id(sys_state) = next;
+            id(ui_refresh)->execute();
+          }

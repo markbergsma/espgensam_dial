@@ -1,0 +1,108 @@
+# espgensam_dial — M5Stack Dial v1.1 remote control for a Genelec SAM system.
+#
+# This file is the device config: identity, network, and every tunable. All behaviour lives in
+# packages/. See README.md for the architecture and AGENTS.md for the seam contract.
+
+substitutions:
+  name: "espgensam-dial"
+  friendly_name: "Genelec Dial"
+
+  # ---------------------------------------------------------------------------------------------
+  # espgensam entity IDs.
+  #
+  # These are the ids espgensam's *committed* configuration produces (friendly name "Genelec SAM
+  # Controller", media player "Genelec SAM System"). They are almost certainly not yours.
+  #
+  # VERIFY IN HOME ASSISTANT BEFORE THE FIRST FLASH (Developer Tools -> States). ESPHome derives
+  # entity ids from the device friendly name plus the entity name, and either may have been
+  # renamed in Home Assistant afterwards — renames stick, so the id can look nothing like the
+  # YAML. Getting one wrong makes that value read `unknown` forever, with no error.
+  #
+  # Rather than editing this file, copy espgensam_dial-local.yaml (gitignored) and override the
+  # three substitutions there, the same way espgensam keeps its real serial numbers out of its
+  # committed config.
+  #
+  # These three are the only espgensam entities the dial depends on.
+  # ---------------------------------------------------------------------------------------------
+  ent_volume: "number.genelec_sam_controller_volume_db"
+  ent_media: "media_player.genelec_sam_system"
+  ent_bus_status: "sensor.genelec_sam_controller_bus_status"
+
+  # ---------------------------------------------------------------------------------------------
+  # Knob feel: accelerated 0.5 dB steps.
+  #
+  # A detent's step depends on how long since the previous detent, so slow deliberate clicks trim
+  # finely while a flick crosses the range. At 16 detents/revolution a -80..-25 dB range is 110
+  # detents (~7 revolutions) at a flat 0.5 dB; the flick tier brings that under 3 revolutions.
+  # ---------------------------------------------------------------------------------------------
+  gap_flick: "60"      # ms; below this, spinning fast
+  gap_brisk: "120"     # ms
+  gap_steady: "200"    # ms; above this, deliberate single clicks
+  step_flick: "3.0"    # dB per detent when spinning fast
+  step_brisk: "2.0"    # dB
+  step_steady: "1.0"   # dB
+  step_slow: "0.5"     # dB — matches espgensam's native step
+
+  # Encoder counts per detent. CONFIRM ON THE BENCH (see README bring-up): ESPHome's default of 1
+  # should give one count per detent, but M5Stack's own example uses 4.
+  #
+  # The acceleration ladder above assumes ONE trigger per physical detent. If 4 is needed, its
+  # four triggers arrive microseconds apart, so three of them clear gap_flick and each applies
+  # step_flick — roughly 10 dB per detent. Retune the ladder alongside this value, do not change
+  # it on its own.
+  encoder_resolution: "1"
+
+  # ---------------------------------------------------------------------------------------------
+  # Write coalescing.
+  #
+  # espgensam has NO throttling on its volume path: each write synchronously transmits an RS-485
+  # frame and calls parser_.clear(), discarding in-flight monitor telemetry. Four missed poll
+  # cycles marks a monitor offline, so the dial must rate-cap itself. 200 ms (5 writes/s) is about
+  # one frame per 1 s poll cycle plus margin.
+  # ---------------------------------------------------------------------------------------------
+  write_min_interval: "200"   # ms — hard cap between writes while turning
+  write_settle: "90"          # ms of stillness that forces an immediate flush
+  reconcile_grace: "600"      # ms after local change / our write during which reports are ignored
+
+  # ---------------------------------------------------------------------------------------------
+  # Display
+  # ---------------------------------------------------------------------------------------------
+  idle_timeout: "20s"
+  idle_brightness: "0.15"     # dim, never blank — the readout stays legible across the room
+  active_brightness: "1.0"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  includes:
+    - include/dial_state.h
+  on_boot:
+    # Paint a coherent screen before any state arrives. Priority must be low (late): ui_refresh
+    # issues LVGL actions, and LVGL is not initialised until its component has set up.
+    priority: -100
+    then:
+      - script.execute: ui_refresh
+
+packages:
+  board: !include packages/board_m5stack_dial.yaml
+  target: !include packages/target_espgensam_ha.yaml
+  control: !include packages/control.yaml
+  ui: !include packages/ui_volume.yaml
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    password: !secret ap_password
+
+captive_portal:
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome

@@ -1,0 +1,389 @@
+# CONTROL: input handling, optimistic local state, write coalescing, reconciliation.
+#
+# This package must never name a Home Assistant entity or call an HA action directly. It talks to
+# the controlled system only through the target_* scripts provided by the transport package, and
+# reads system condition only from the globals that package writes. That is what makes the
+# transport swappable.
+
+globals:
+  # --- Written by the transport package -----------------------------------------------------
+  - id: vol_db
+    type: float
+    restore_value: false
+    initial_value: "-50.0"
+  # Fallbacks, used only for clamping until the real bounds arrive from Home Assistant. They
+  # match espgensam's committed config; the -25.0 variant lives in its
+  # espgensam-atoms3-rs485-iso-local.yaml. Never treat these as the truth — bounds_known says
+  # whether the real ones have landed, and the UI suppresses the scale until they have.
+  - id: vol_min
+    type: float
+    restore_value: false
+    initial_value: "-80.0"
+  - id: vol_max
+    type: float
+    restore_value: false
+    initial_value: "-30.0"
+  - id: vol_step
+    type: float
+    restore_value: false
+    initial_value: "0.5"
+  - id: bounds_known # real min/max/step received from Home Assistant and usable
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: bounds_seen # bitmask of arrived attributes: 0x01 min, 0x02 max, 0x04 step
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+  # Whether vol_db reflects a value Home Assistant actually reported. False at boot and whenever
+  # the entity goes unavailable — Home Assistant then sends a state ESPHome cannot parse, and the
+  # homeassistant number platform publishes NAN for it. Without this the dial would believe its
+  # own -50.0 placeholder, and relative knob movement would jump from a value nobody chose.
+  - id: volume_known
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: is_muted
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: sys_power_off # media_player reports "off"; the ONLY basis for power intent
+    type: bool
+    restore_value: false
+    initial_value: "true"
+  - id: sys_state
+    type: int
+    restore_value: false
+    initial_value: "0" # STATE_DISCONNECTED — nothing is known until the API connects
+  - id: mute_pending_until_ms # optimistic mute awaiting confirmation; 0 = nothing pending
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # --- Owned by control / UI ----------------------------------------------------------------
+  - id: vol_sent # last value handed to the transport
+    type: float
+    restore_value: false
+    initial_value: "-50.0"
+  - id: vol_reported # last value the transport reported, even when ignored
+    type: float
+    restore_value: false
+    initial_value: "-50.0"
+  - id: last_detent_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_local_change_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_write_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: at_limit
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: at_limit_edge # true only on the detent that first reaches a limit
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: ui_arc_pos # 0..1000, normalized volume position
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: refused_until_ms # amber "write refused" pulse expiry
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+switch:
+  # Audible detent clicks, off by default. An 80 dB buzzer ticking on every detent is intolerable
+  # in a studio, and this is a device whose entire job is not making unwanted noise — so the
+  # buzzer is reserved for information (range limits, refused writes) unless you ask otherwise.
+  - platform: template
+    name: "Click feedback"
+    id: click_feedback
+    icon: mdi:volume-vibrate
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+
+sensor:
+  # Exposed so the dial's own view of volume is visible in Home Assistant for debugging. Not used
+  # by the UI, which reads the global directly.
+  - platform: template
+    name: "Dial Volume"
+    id: dial_volume_debug
+    unit_of_measurement: dB
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: "return id(vol_db);"
+
+  # Encoder triggers are bound here rather than in the board package, so that swapping the board
+  # cannot accidentally change what a detent means.
+  - id: !extend dial_encoder
+    on_clockwise:
+      - script.execute:
+          id: dial_turned
+          dir: 1
+    on_anticlockwise:
+      - script.execute:
+          id: dial_turned
+          dir: -1
+
+script:
+  # ---------------------------------------------------------------------------------------------
+  # One detent of the encoder.
+  #
+  # mode: parallel is belt-and-braces. This body contains no delay, so script.execute runs it
+  # synchronously to completion and detents cannot actually overlap today. But if a delay is ever
+  # added here, `single` would start silently dropping detents with a "script already running"
+  # warning — and dropping a detent is the one failure this device must not have.
+  # ---------------------------------------------------------------------------------------------
+  - id: dial_turned
+    mode: parallel
+    max_runs: 8
+    parameters:
+      dir: int
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const uint32_t gap = now - id(last_detent_ms);
+          id(last_detent_ms) = now;
+
+          // espgensam silently drops writes in both of these conditions. Refuse the input rather
+          // than moving the arc and letting it snap back, which would read as a bug in the dial.
+          // volume_known matters as much as the bus states: a detent is a *relative* change, so
+          // without a known starting point it would jump the system to an arbitrary level.
+          if (id(sys_state) == STATE_DISCONNECTED || id(sys_state) == STATE_GLM_LOCKED ||
+              !id(volume_known)) {
+            id(refused_until_ms) = now + 700;
+            // `return` ends this lambda, not the script: the actions below still run. Clear the
+            // edge flag or feedback_tick would beep using the previous accepted detent's value.
+            id(at_limit_edge) = false;
+            return;
+          }
+
+          // Acceleration: the faster you turn, the coarser the step.
+          float step = ${step_slow};
+          if (gap < ${gap_flick}) {
+            step = ${step_flick};
+          } else if (gap < ${gap_brisk}) {
+            step = ${step_brisk};
+          } else if (gap < ${gap_steady}) {
+            step = ${step_steady};
+          }
+
+          float v = id(vol_db) + dir * step;
+          // Snap to the device's own grid so we never ask for an unrepresentable value.
+          if (id(vol_step) > 0.0f) {
+            v = roundf(v / id(vol_step)) * id(vol_step);
+          }
+          const bool was_at_limit = id(at_limit);
+          id(vol_db) = std::min(std::max(v, id(vol_min)), id(vol_max));
+          id(at_limit) = (id(vol_db) <= id(vol_min) + 0.001f ||
+                          id(vol_db) >= id(vol_max) - 0.001f);
+          // Only the detent that *arrives* at a limit is notable. Holding the knob against the
+          // stop must not buzz on every detent.
+          id(at_limit_edge) = (!was_at_limit && id(at_limit));
+          id(last_local_change_ms) = now;
+      - script.execute: wake_backlight
+      # Local and immediate — this, not the network round trip, is the perceived responsiveness.
+      - script.execute: ui_refresh
+      - script.execute: feedback_tick
+
+  # ---------------------------------------------------------------------------------------------
+  # Reconciliation of reported volume against local state.
+  #
+  # Three cases have to be told apart: the echo of our own write, a stale value arriving while the
+  # user is still turning, and a genuine external change (HA slider, Genelec's GLM software, or
+  # espgensam snapping back a refused write).
+  # ---------------------------------------------------------------------------------------------
+  - id: on_volume_reported
+    parameters:
+      reported: float
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+
+          // An unavailable/unknown entity arrives here as NAN (HomeassistantNumber publishes NAN
+          // when it cannot parse the state). Every comparison below would then be false, so the
+          // guards fail *open*: NAN would be adopted into vol_db and vol_sent, the flusher would
+          // see a permanently dirty value, and the dial would write value: "nan" to Home
+          // Assistant every 50 ms. Reject it up front and mark the volume unknown instead.
+          if (!std::isfinite(reported)) {
+            if (id(volume_known)) {
+              ESP_LOGW("dial", "volume entity reported no usable value; volume now unknown");
+            }
+            id(volume_known) = false;
+            return;
+          }
+
+          id(vol_reported) = reported;
+          const bool first_report = !id(volume_known);
+          id(volume_known) = true;
+
+          // The first usable report is authoritative: adopt it outright rather than reconciling
+          // against the placeholder vol_db started from.
+          if (first_report) {
+            ESP_LOGI("dial", "volume known: %.1f dB", reported);
+            id(vol_db) = reported;
+            id(vol_sent) = reported;
+            return;
+          }
+
+          const bool user_active = (now - id(last_local_change_ms)) < ${reconcile_grace};
+          const bool write_inflight = (now - id(last_write_ms)) < ${reconcile_grace};
+          if (user_active || write_inflight) {
+            // Our own echo, or stale. Recorded above so the next genuine report can be judged.
+            return;
+          }
+
+          const float tol = (id(vol_step) > 0.0f) ? id(vol_step) / 2.0f : 0.25f;
+          if (fabsf(reported - id(vol_db)) < tol) {
+            return;  // already agreed
+          }
+
+          // Diverged after the grace period. If it also differs from what we last sent, the
+          // device rejected our write rather than someone else changing it.
+          const bool rejection =
+              fabsf(reported - id(vol_sent)) >= ((id(vol_step) > 0.0f) ? id(vol_step) : 0.5f);
+          ESP_LOGI("dial", "adopting reported volume %.1f dB (was %.1f, rejection=%d)",
+                   reported, id(vol_db), rejection);
+          id(vol_db) = reported;
+          id(vol_sent) = reported;
+          if (rejection) {
+            id(refused_until_ms) = now + 700;
+          }
+      - script.execute: ui_refresh
+
+  # Short press: mute. Optimistic local flip so the screen reacts at once; the transport's
+  # binary_sensor corrects it if Home Assistant disagrees.
+  - id: dial_pressed
+    then:
+      - script.execute: wake_backlight
+      - if:
+          condition:
+            lambda: |-
+              return id(sys_state) != STATE_DISCONNECTED && id(sys_state) != STATE_GLM_LOCKED;
+          then:
+            # target_toggle_mute performs the optimistic flip itself and arms the confirmation
+            # timeout, because only the transport knows how the change gets confirmed.
+            - script.execute: target_toggle_mute
+            - script.execute: ui_refresh
+          else:
+            - lambda: |-
+                id(refused_until_ms) = millis() + 700;
+            - script.execute: ui_refresh
+
+  # Long press: power. Deliberate gesture for the rarer, more consequential action.
+  - id: dial_held
+    then:
+      - script.execute: wake_backlight
+      - if:
+          condition:
+            lambda: |-
+              return id(sys_state) != STATE_DISCONNECTED && id(sys_state) != STATE_GLM_LOCKED;
+          then:
+            - script.execute:
+                id: target_set_power
+                # From the media_player state alone. Deriving this from sys_state used to mean a
+                # system that was both off AND had no monitors online resolved to OFFLINE, so a
+                # long press sent turn_off to an already-off system and could never switch it on.
+                power_on: !lambda "return id(sys_power_off);"
+          else:
+            - lambda: |-
+                id(refused_until_ms) = millis() + 700;
+            - script.execute: ui_refresh
+
+  # Buzzer. Silent on ordinary detents unless the user opted in; always audible at a range limit.
+  - id: feedback_tick
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(at_limit_edge);"
+          then:
+            - rtttl.play: "limit:d=32,o=6,b=200:c"
+          else:
+            - if:
+                condition:
+                  switch.is_on: click_feedback
+                then:
+                  - rtttl.play: "tick:d=64,o=7,b=220:c"
+
+  - id: wake_backlight
+    mode: restart
+    then:
+      - light.turn_on:
+          id: display_backlight
+          brightness: ${active_brightness}
+
+  - id: dim_backlight
+    mode: restart
+    then:
+      - light.turn_on:
+          id: display_backlight
+          brightness: ${idle_brightness}
+
+interval:
+  # ---------------------------------------------------------------------------------------------
+  # The coalescing flusher.
+  #
+  # Two conditions trigger a write, because they solve different problems:
+  #   rate_ok  caps sustained writes so the speakers *track* during a spin instead of jumping at
+  #            the end, without flooding espgensam's unthrottled RS-485 path.
+  #   settled  guarantees the exact final value lands even if the spin ends between ticks.
+  #
+  # last_write_ms MUST be set before calling the transport: target_set_volume re-enters
+  # on_volume_reported synchronously, and the reconciler relies on that timestamp to recognise
+  # the echo as its own.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 50ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          // Nothing to send until a real value has been reported, and never send a non-finite
+          // one: a NAN difference compares false against every threshold, so it would read as
+          // permanently dirty and write on every tick.
+          if (!id(volume_known) || !std::isfinite(id(vol_db)) || !std::isfinite(id(vol_sent))) {
+            return;
+          }
+          if (fabsf(id(vol_db) - id(vol_sent)) < 0.01f) {
+            return;  // not dirty
+          }
+          const bool rate_ok = (now - id(last_write_ms)) >= ${write_min_interval};
+          const bool settled = (now - id(last_local_change_ms)) >= ${write_settle};
+          if (!rate_ok && !settled) {
+            return;
+          }
+          id(vol_sent) = id(vol_db);
+          id(last_write_ms) = now;
+          id(target_set_volume)->execute(id(vol_db));
+
+  # Expire the amber "refused" pulse.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          static bool was_showing = false;
+          const bool showing = millis() < id(refused_until_ms);
+          if (was_showing && !showing) {
+            id(ui_refresh)->execute();
+          }
+          was_showing = showing;
+
+binary_sensor:
+  - id: !extend front_button
+    on_multi_click:
+      - timing:
+          - ON for at most 500ms
+          - OFF for at least 30ms
+        then:
+          - script.execute: dial_pressed
+      - timing:
+          - ON for at least 800ms
+        then:
+          - script.execute: dial_held

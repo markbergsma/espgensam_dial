@@ -1,0 +1,253 @@
+# UI: the volume screen.
+#
+# Like control.yaml, this package must never name a Home Assistant entity. It renders the globals
+# and nothing else.
+#
+# Layout notes for the 240x240 round panel: the bezel eats the corners, so everything meaningful
+# lives inside a ~200 px safe circle and every element is centre-aligned with a vertical offset.
+# The vertical offsets were chosen so the readout stays legible across a room; they are the most
+# likely thing to want nudging on the bench.
+#
+# Colour vocabulary is borrowed from espgensam's own status LED (components/gensam/status_led.cpp):
+#   Active green / GLM Active amber / waking cyan / Standby dim green / Offline dim white.
+#
+# Two deliberate departures from that LED, so do not "restore" them:
+#   - espgensam distinguishes Discovering (blue) from Configuring (cyan). The dial collapses both
+#     into STATE_WAKING and shows one cyan, because the difference is an internal phase of the
+#     RACE cycle and means nothing to someone holding a volume knob.
+#   - The two are not guaranteed to be side by side anyway: the Waveshare controller has no RGB
+#     LED and therefore no status_led at all, so on that board this is the only status indicator
+#     rather than a second opinion.
+
+font:
+  # Glyph subsetting keeps compile time and RAM down. Flash is 8 MB so the fonts themselves are
+  # cheap, but every glyph is rasterised into the binary.
+  - file: "gfonts://Rubik@600"
+    id: font_value
+    size: 52
+    bpp: 4
+    glyphs: "-.0123456789"
+  - file: "gfonts://Rubik@500"
+    id: font_pct
+    size: 22
+    bpp: 4
+    glyphs: "-0123456789%"
+  - file: "gfonts://Rubik"
+    id: font_small
+    size: 16
+    bpp: 4
+    # Carries the "dB" unit, every status badge word and "MUTE".
+    glyphs: " %-.0123456789ABCDEFGHIKLMNOPRSTUVWYabcdefghiklmnoprstuvwy"
+
+lvgl:
+  displays: [round_display]
+  touchscreens: [touch]
+  # No rotation. The mipi_spi GC9A01A model already applies mirror_x, which lands this panel the
+  # right way up on its own.
+  #
+  # Do not reinstate `rotation: 180`. It comes from widely-copied M5Dial configs built on the
+  # deprecated `ili9xxx` driver, whose GC9A01A has a different init sequence and so a different
+  # base orientation; carrying that value over to mipi_spi renders the whole screen upside down.
+  # A quick check that this is right: the volume arc's gap (start_angle 135 / end_angle 45) must
+  # sit at the BOTTOM, under the hand. If it is at the top, the rotation is wrong.
+  #
+  # Rotation belongs here rather than on the display so that LVGL rotates touch coordinates with
+  # it — that remains true if a future panel does need rotating.
+  rotation: 0
+  # 240*240*2 = 115 KB for a full frame, against 512 KB SRAM and NO PSRAM. 25% is the documented
+  # recommendation for PSRAM-less boards; ESPHome falls back to 12% if allocation fails.
+  buffer_size: 25%
+  bg_color: 0x000000
+  default_font: font_small
+  on_idle:
+    timeout: ${idle_timeout}
+    then:
+      - script.execute: dim_backlight
+
+  pages:
+    - id: page_volume
+      bg_color: 0x000000
+      pad_all: 0
+      widgets:
+        # The volume ring. 270 degrees of sweep with the gap at the bottom, which is where the
+        # hand covers the screen anyway.
+        - arc:
+            id: vol_arc
+            align: CENTER
+            width: 226
+            height: 226
+            min_value: 0
+            # Normalized rather than in dB: the real range is discovered from Home Assistant at
+            # runtime, and an arc value is an int16 so half-dB steps would not survive it.
+            max_value: 1000
+            value: 0
+            start_angle: 135
+            end_angle: 45
+            arc_width: 16
+            arc_rounded: true
+            # Touch must never drag the volume — a stray palm should not change monitor level.
+            adjustable: false
+            # The default 720 deg/s animation limit visibly trails a fast spin, which is exactly
+            # the lag this whole design exists to avoid.
+            change_rate: 3600
+            arc_color: 0x1A1A1A
+            indicator:
+              arc_color: 0x22C55E
+              arc_width: 16
+              arc_rounded: true
+
+        # Status badge. Empty (invisible) whenever the system is plainly active.
+        - label:
+            id: status_label
+            align: CENTER
+            y: -60
+            text: ""
+            text_font: font_small
+            text_color: 0xF59E0B
+
+        # Primary readout: dB.
+        - label:
+            id: vol_label
+            align: CENTER
+            y: -18
+            text: "--.-"
+            text_font: font_value
+            text_color: 0xFFFFFF
+
+        - label:
+            id: unit_label
+            align: CENTER
+            y: 20
+            text: "dB"
+            text_font: font_small
+            text_color: 0x8A8A8A
+
+        # Secondary readout: percentage, matching the 0..1 scale Home Assistant's media_player
+        # shows. See ui_refresh for why this is computed locally rather than read back.
+        - label:
+            id: pct_label
+            align: CENTER
+            y: 46
+            text: "--%"
+            text_font: font_pct
+            text_color: 0xA8A8A8
+
+        - label:
+            id: mute_label
+            align: CENTER
+            y: 74
+            text: ""
+            text_font: font_small
+            text_color: 0xEF4444
+
+        # Full-screen invisible tap target. Tapping only wakes the backlight — it deliberately
+        # does not change volume, mute or power, so picking the device up is never destructive.
+        - button:
+            id: touch_overlay
+            align: CENTER
+            width: 240
+            height: 240
+            bg_opa: 0%
+            border_width: 0
+            shadow_width: 0
+            on_short_click:
+              - script.execute: wake_backlight
+
+script:
+  # ---------------------------------------------------------------------------------------------
+  # Repaint everything from the globals. Called on every detent (hence kept cheap) and on every
+  # state change.
+  #
+  # The percentage is computed here rather than read back from Home Assistant's volume_level
+  # attribute. espgensam maps the media_player's 0..1 slider linearly in dB across the same bounds
+  # the number entity reports (volume_db_to_slider() in components/gensam/util.h), so the
+  # percentage is arithmetically identical to the normalized arc position. Computing it locally
+  # keeps it in the same instant as the arc and the dB number; reading it back would make it visibly
+  # lag the value it sits directly beneath, which looks broken.
+  #
+  # Note 0% here means vol_min (-80 dB), not silence: espgensam treats only slider <= 0.001 as true
+  # silence (-130 dB), and that case is unreachable coming from dB.
+  #
+  # The scale is suppressed until bounds_known. The dB number stays visible throughout because it
+  # is truthful on its own — it comes from the entity's state — but the arc and percentage are
+  # meaningless without the real range, and drawing them against the fallback would state a
+  # precise-looking figure that is simply wrong (at -80..-25 bounds, -50 dB reads 60% on a
+  # -80..-30 guess instead of 55%).
+  # ---------------------------------------------------------------------------------------------
+  - id: ui_refresh
+    mode: restart
+    then:
+      - lambda: |-
+          const float span = id(vol_max) - id(vol_min);
+          if (id(volume_known) && id(bounds_known) && span > 0.1f) {
+            float frac = (id(vol_db) - id(vol_min)) / span;
+            frac = std::min(std::max(frac, 0.0f), 1.0f);
+            id(ui_arc_pos) = (int) lroundf(frac * 1000.0f);
+          } else {
+            id(ui_arc_pos) = 0;
+          }
+
+      - lvgl.arc.update:
+          id: vol_arc
+          value: !lambda "return id(ui_arc_pos);"
+
+      - lvgl.label.update:
+          id: vol_label
+          text: !lambda |-
+            // Until Home Assistant reports a usable value there is no honest number to show.
+            // The placeholder vol_db started from is not one.
+            if (!id(volume_known) || !std::isfinite(id(vol_db))) {
+              return std::string("--.-");
+            }
+            char buf[10];
+            snprintf(buf, sizeof(buf), "%.1f", id(vol_db));
+            return std::string(buf);
+
+      - lvgl.label.update:
+          id: pct_label
+          text: !lambda |-
+            if (!id(volume_known) || !id(bounds_known)) return std::string("--%");
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d%%", (int) lroundf(id(ui_arc_pos) / 10.0f));
+            return std::string(buf);
+
+      # Ring colour: the refusal pulse overrides everything, then the system state.
+      - lvgl.arc.update:
+          id: vol_arc
+          indicator:
+            arc_color: !lambda |-
+              if (millis() < id(refused_until_ms)) return lv_color_hex(0xF59E0B);  // amber
+              if (id(is_muted)) return lv_color_hex(0x555555);
+              switch (id(sys_state)) {
+                case STATE_DISCONNECTED: return lv_color_hex(0x3A3A3A);
+                case STATE_GLM_LOCKED:   return lv_color_hex(0xF59E0B);
+                case STATE_WAKING:       return lv_color_hex(0x00CCFF);  // cyan, configuring
+                case STATE_OFFLINE:      return lv_color_hex(0x6A6A6A);  // dim white
+                case STATE_STANDBY:      return lv_color_hex(0x116633);  // dim green
+                default:                 return lv_color_hex(0x22C55E);  // green
+              }
+
+      # The dB number dims whenever the value is not currently audible.
+      - lvgl.label.update:
+          id: vol_label
+          text_color: !lambda |-
+            const bool live = (id(sys_state) == STATE_ACTIVE) && !id(is_muted);
+            return live ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x777777);
+
+      - lvgl.label.update:
+          id: status_label
+          text: !lambda |-
+            if (millis() < id(refused_until_ms)) return std::string("refused");
+            switch (id(sys_state)) {
+              case STATE_DISCONNECTED: return std::string("no link");
+              case STATE_GLM_LOCKED:   return std::string("GLM");
+              case STATE_WAKING:       return std::string("waking");
+              case STATE_OFFLINE:      return std::string("no monitors");
+              case STATE_STANDBY:      return std::string("standby");
+              default:                 return std::string("");
+            }
+
+      - lvgl.label.update:
+          id: mute_label
+          text: !lambda |-
+            return id(is_muted) ? std::string("MUTE") : std::string("");

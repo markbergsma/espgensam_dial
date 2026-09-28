@@ -1,0 +1,149 @@
+# M5Stack Dial v1.1 — HARDWARE ONLY.
+#
+# This package declares peripherals and nothing else: no volume logic, no Home Assistant entities,
+# no LVGL widgets. It is the seam for supporting other dial controllers — a different board gets a
+# different file here and the control/UI/target packages are untouched.
+#
+# What it must provide for the rest of the project:
+#   - spi_bus / internal_i2c        buses
+#   - round_display                 a 240x240 display for LVGL
+#   - touch                         a touchscreen for LVGL
+#   - dial_encoder                  rotary_encoder firing dial_turned (wired in control.yaml)
+#   - front_button                  binary_sensor for mute/power gestures
+#   - display_backlight             monochromatic light, for idle dimming
+#   - buzzer_out / buzzer           ledc output + rtttl player for limit/refusal feedback
+#
+# Hardware reference: M5Stamp-S3A (ESP32-S3FN8), 8 MB flash, 512 KB SRAM, NO PSRAM.
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+# The GC9A01A panel is driven over plain SPI; only MOSI and CLK are wired (write-only display).
+spi:
+  id: spi_bus
+  mosi_pin: GPIO5
+  clk_pin: GPIO6
+
+# Internal bus shared by the touch controller (0x38), the RTC (0x51) and the RFID reader (0x28).
+i2c:
+  - id: internal_i2c
+    sda: GPIO11
+    scl: GPIO12
+    frequency: 400kHz
+
+output:
+  # Backlight. NOTE: this PWM output boots LOW, so without the light below driving it on, the
+  # screen stays black and looks like a dead board.
+  - platform: ledc
+    pin: GPIO9
+    id: backlight_out
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO3
+    id: buzzer_out
+    frequency: 4000Hz
+
+light:
+  - platform: monochromatic
+    id: display_backlight
+    output: backlight_out
+    default_transition_length: 120ms
+    # ALWAYS_ON matters: anything else can leave the panel dark after a power cycle.
+    restore_mode: ALWAYS_ON
+
+rtttl:
+  id: buzzer
+  output: buzzer_out
+  gain: 0.4
+
+display:
+  - platform: mipi_spi
+    id: round_display
+    model: GC9A01A
+    spi_id: spi_bus
+    cs_pin: GPIO7
+    dc_pin: GPIO4
+    reset_pin: GPIO8
+    # Without this every colour renders negative.
+    invert_colors: true
+    data_rate: 40MHz
+    # Rotation is applied in LVGL, not here, so that touch coordinates rotate with it.
+    auto_clear_enabled: false
+
+touchscreen:
+  # The panel's controller is an FT3267, which the ft5x06 driver speaks.
+  #
+  # interrupt_pin is not optional in practice, despite M5Stack's own example and the ESPHome
+  # device page both omitting it (the latter still says the option is unsupported, which is out
+  # of date). Without it, Touchscreen::update() forces a read every poll interval, so the driver
+  # hits TD_STATUS over I2C even when nothing has been touched. An idle FT3267 answers that with
+  # a NAK or garbage, which surfaces as a periodic "Failed to read status" warning. With the pin
+  # set, update() calls stop_poller() and the controller is read only when it signals a touch —
+  # quieter, and it stops pointless I2C traffic in the idle loop.
+  #
+  # Expect one "Touch Polling Stopped" warning at boot; that is the driver confirming the switch.
+  - platform: ft5x06
+    id: touch
+    i2c_id: internal_i2c
+    address: 0x38
+    interrupt_pin: GPIO14
+
+sensor:
+  # The encoder is read by ESPHome directly rather than through LVGL's `encoders:` input driver.
+  # That is deliberate: LVGL's encoder support is a focus-group navigator (turn = change focus,
+  # press = enter edit mode), which is wrong for a dedicated volume knob, and it would also mean
+  # the first detent after an idle timeout gets consumed waking the UI instead of changing volume.
+  - platform: rotary_encoder
+    id: dial_encoder
+    pin_a:
+      number: GPIO40
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: GPIO41
+      mode:
+        input: true
+        pullup: true
+    resolution: ${encoder_resolution}
+    # Free-running counter; we only consume the direction triggers, never the absolute value.
+    min_value: -1000000
+    max_value: 1000000
+
+binary_sensor:
+  # Under-screen front button. Gestures are bound in control.yaml.
+  - platform: gpio
+    id: front_button
+    pin:
+      number: GPIO42
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+
+time:
+  # Battery-backed RTC. Unused in phase 1; present so an idle clock face is a UI-only change.
+  - platform: pcf8563
+    id: rtc_time
+    i2c_id: internal_i2c
+    address: 0x51
+    update_interval: never
+
+# GPIO46 is deliberately NOT declared.
+#
+# It is dual-purpose: the side button when the Dial is wall-powered, or the power-hold latch when
+# running on a battery. A desk remote is wall-powered, so the pin is left free as a spare input.
+# For battery operation, uncomment the following instead — and note the two uses are mutually
+# exclusive, since latching the pin high makes it unreadable as a button:
+#
+# switch:
+#   - platform: gpio
+#     pin: GPIO46
+#     id: power_hold
+#     restore_mode: ALWAYS_ON
