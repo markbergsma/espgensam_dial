@@ -1,4 +1,4 @@
-# CONTROL: input handling, optimistic local state, write coalescing, reconciliation.
+# CONTROL: input handling, optimistic local state, writes, reconciliation.
 #
 # This package must never name a Home Assistant entity or call an HA action directly. It talks to
 # the controlled system only through the target_* scripts provided by the transport package, and
@@ -194,6 +194,28 @@ script:
       # Local and immediate — this, not the network round trip, is the perceived responsiveness.
       - script.execute: ui_refresh
       - script.execute: feedback_tick
+      # Hand the new value to the transport. One write per detent is fine: espgensam paces and
+      # coalesces volume writes itself, sending each in a safe bus slot at most every 50 ms
+      # (its `volume_tx_interval`), so the dial does not need to rate-limit.
+      #
+      # This runs even after a refused detent (the `return` above only ends that lambda); the
+      # dirty check makes it a no-op then, and at a range limit.
+      #
+      # last_write_ms MUST be set before calling the transport: target_set_volume re-enters
+      # on_volume_reported synchronously, and the reconciler relies on that timestamp to
+      # recognise the echo as its own.
+      - lambda: |-
+          // Never send a value that was not derived from a real report, nor a non-finite one: a
+          // NAN difference compares false against every threshold and would read as dirty forever.
+          if (!id(volume_known) || !std::isfinite(id(vol_db)) || !std::isfinite(id(vol_sent))) {
+            return;
+          }
+          if (fabsf(id(vol_db) - id(vol_sent)) < 0.01f) {
+            return;  // not dirty
+          }
+          id(vol_sent) = id(vol_db);
+          id(last_write_ms) = millis();
+          id(target_set_volume)->execute(id(vol_db));
 
   # ---------------------------------------------------------------------------------------------
   # Reconciliation of reported volume against local state.
@@ -211,9 +233,9 @@ script:
 
           // An unavailable/unknown entity arrives here as NAN (HomeassistantNumber publishes NAN
           // when it cannot parse the state). Every comparison below would then be false, so the
-          // guards fail *open*: NAN would be adopted into vol_db and vol_sent, the flusher would
-          // see a permanently dirty value, and the dial would write value: "nan" to Home
-          // Assistant every 50 ms. Reject it up front and mark the volume unknown instead.
+          // guards fail *open*: NAN would be adopted into vol_db and vol_sent, the write path
+          // would see a permanently dirty value, and the dial would write value: "nan" to Home
+          // Assistant on every detent. Reject it up front and mark the volume unknown instead.
           if (!std::isfinite(reported)) {
             if (id(volume_known)) {
               ESP_LOGW("dial", "volume entity reported no usable value; volume now unknown");
@@ -330,40 +352,6 @@ script:
           brightness: ${idle_brightness}
 
 interval:
-  # ---------------------------------------------------------------------------------------------
-  # The coalescing flusher.
-  #
-  # Two conditions trigger a write, because they solve different problems:
-  #   rate_ok  caps sustained writes so the speakers *track* during a spin instead of jumping at
-  #            the end, without flooding espgensam's unthrottled RS-485 path.
-  #   settled  guarantees the exact final value lands even if the spin ends between ticks.
-  #
-  # last_write_ms MUST be set before calling the transport: target_set_volume re-enters
-  # on_volume_reported synchronously, and the reconciler relies on that timestamp to recognise
-  # the echo as its own.
-  # ---------------------------------------------------------------------------------------------
-  - interval: 50ms
-    then:
-      - lambda: |-
-          const uint32_t now = millis();
-          // Nothing to send until a real value has been reported, and never send a non-finite
-          // one: a NAN difference compares false against every threshold, so it would read as
-          // permanently dirty and write on every tick.
-          if (!id(volume_known) || !std::isfinite(id(vol_db)) || !std::isfinite(id(vol_sent))) {
-            return;
-          }
-          if (fabsf(id(vol_db) - id(vol_sent)) < 0.01f) {
-            return;  // not dirty
-          }
-          const bool rate_ok = (now - id(last_write_ms)) >= ${write_min_interval};
-          const bool settled = (now - id(last_local_change_ms)) >= ${write_settle};
-          if (!rate_ok && !settled) {
-            return;
-          }
-          id(vol_sent) = id(vol_db);
-          id(last_write_ms) = now;
-          id(target_set_volume)->execute(id(vol_db));
-
   # Expire the amber "refused" pulse.
   - interval: 250ms
     then:

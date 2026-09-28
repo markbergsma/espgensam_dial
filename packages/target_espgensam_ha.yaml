@@ -15,8 +15,8 @@
 # volume for the duration (start_group_apply_/finish_group_apply_ in components/gensam/race.cpp).
 # The duck sends a broadcast frame only: it never touches current_volume_db_ and never publishes
 # state, so the dial keeps showing the true target throughout and must NOT try to follow it. A
-# dial write landing mid-push transmits immediately and audibly un-ducks for the remainder of the
-# push; the closing restore then re-sends the real value, so state converges on its own.
+# dial write made mid-push is accepted and published at once but held back from the bus until
+# the push ends, when the closing restore sends it — so turning the knob cannot lift the duck.
 #
 # Only three espgensam entities are used. The 42 per-monitor entities (mute, online, temperature,
 # levels, model/serial/firmware, identify, input routing, crossover, level, delay, calibration
@@ -180,7 +180,7 @@ script:
       # Calling the action directly removes that failure mode and makes all three writes below use
       # one code path. Clamping is not lost: dial_turned already clamps to [vol_min, vol_max], and
       # this clamps again defensively.
-      # The finite check is defence in depth — the flusher already refuses to call us with a
+      # The finite check is defence in depth — dial_turned already refuses to call us with a
       # value it does not have. std::min/max propagate NAN rather than clamping it away, so
       # without this a single unparseable report from Home Assistant would come straight back as
       # `value: "nan"`.

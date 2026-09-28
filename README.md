@@ -4,7 +4,7 @@
 into a physical remote control — primarily a volume knob — for a Genelec SAM monitor system driven
 by [`espgensam`](https://github.com/markbergsma/espgensam).
 
-Turning the knob moves the on-screen volume instantly; the monitors follow within about 200 ms. The
+Turning the knob moves the on-screen volume instantly; the monitors follow within a few tens of milliseconds. The
 round display shows the level in dB, the equivalent percentage, and the condition of the system at
 a glance.
 
@@ -25,8 +25,8 @@ fits the thing you do most often at a desk: reach out and turn a knob.
   of seven.
 - **Zero-latency display** — the arc and readout update from local state on the detent itself, not
   after a network round trip.
-- **Self-limiting writes** — coalesced and rate-capped to protect espgensam's unthrottled RS-485
-  path (see [Why the dial rate-limits itself](#why-the-dial-rate-limits-itself)).
+- **Live tracking** — the monitors follow the knob during a spin, not just when it stops (see
+  [How volume changes reach the monitors](#how-volume-changes-reach-the-monitors)).
 - **Honest state** — GLM bus lockout, standby, wake-up progress and loss of the Home Assistant
   link are each shown distinctly, using the same colour vocabulary as espgensam's own status LED.
 - **Runtime bounds discovery** — volume min/max/step are read from Home Assistant, so nothing is
@@ -103,7 +103,7 @@ espgensam_dial.yaml            identity, network, and every tunable as substitut
 packages/
   board_m5stack_dial.yaml      HARDWARE ONLY — swap this file for a different dial controller
   target_espgensam_ha.yaml     TRANSPORT — the only file that knows Home Assistant exists
-  control.yaml                 input, optimistic state, coalescing, reconciliation
+  control.yaml                 input, optimistic state, writes, reconciliation
   ui_volume.yaml               LVGL fonts, page, repaint
 include/dial_state.h           the DialState vocabulary and its precedence rules
 ```
@@ -116,16 +116,13 @@ reach the controlled system only through three scripts (`target_set_volume`, `ta
 That is what makes a planned UDP-direct transport a one-file change, and a different dial
 controller a one-file change in the other direction.
 
-### Why the dial rate-limits itself
+### How volume changes reach the monitors
 
-espgensam has **no throttling on its volume path**: each write synchronously transmits an RS-485
-frame from the ESPHome loop, and each send calls `parser_.clear()`, discarding partially-received
-monitor telemetry. Four consecutive missed poll cycles marks a monitor offline. A fast spin issuing
-one write per detent would therefore knock monitors offline.
-
-So the dial coalesces. Local state updates on every detent — that is what you see and feel — while
-a flusher writes at most every 200 ms (about one frame per espgensam poll cycle), plus an immediate
-flush once the knob has been still for 90 ms so the exact final value always lands.
+The dial updates its own display on every detent and sends each new value straight to Home
+Assistant. It does not pace itself: espgensam coalesces volume requests and sends them to the
+monitors between telemetry polls, at most every 50 ms by default (its `volume_tx_interval`), so a
+fast spin cannot disturb the RS-485 bus. **This needs an espgensam build that includes that
+pacing**; older ones transmit every request immediately.
 
 A reconciler then has to tell three things apart: the echo of the dial's own write, a stale value
 arriving while the user is still turning, and a genuine external change (a Home Assistant slider,

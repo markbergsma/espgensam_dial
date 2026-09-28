@@ -53,15 +53,13 @@ substitutions:
   encoder_resolution: "1"
 
   # ---------------------------------------------------------------------------------------------
-  # Write coalescing.
+  # Reconciliation.
   #
-  # espgensam has NO throttling on its volume path: each write synchronously transmits an RS-485
-  # frame and calls parser_.clear(), discarding in-flight monitor telemetry. Four missed poll
-  # cycles marks a monitor offline, so the dial must rate-cap itself. 200 ms (5 writes/s) is about
-  # one frame per 1 s poll cycle plus margin.
+  # The dial writes on every detent; espgensam paces and coalesces the RS-485 side itself. While
+  # turning, Home Assistant echoes back values the knob has already moved past, so reports are
+  # ignored for this long after a local change or our own write. Long enough to cover an HA round
+  # trip; short enough that a genuine external change is adopted promptly.
   # ---------------------------------------------------------------------------------------------
-  write_min_interval: "200"   # ms — hard cap between writes while turning
-  write_settle: "90"          # ms of stillness that forces an immediate flush
   reconcile_grace: "600"      # ms after local change / our write during which reports are ignored
 
   # ---------------------------------------------------------------------------------------------

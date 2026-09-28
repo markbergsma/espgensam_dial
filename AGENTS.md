@@ -93,10 +93,12 @@ Inherited from `espgensam/AGENTS.md`, adapted for a YAML-dominated project:
 These are properties of `espgensam` as it exists, not preferences. Code that ignores them appears
 to work on the bench and misbehaves in use.
 
-1. **espgensam has no throttling on its volume path.** Each write synchronously transmits an
-   RS-485 frame and calls `parser_.clear()`, discarding in-flight monitor telemetry; four missed
-   poll cycles marks a monitor offline. **Never send a write per detent.** The flusher in
-   `control.yaml` is not an optimisation, it is a correctness requirement.
+1. **espgensam paces volume and mute writes itself.** Its setters only accept a request and
+   publish it; `loop()` transmits it between telemetry polls, coalesced to at most one volume
+   frame per `volume_tx_interval` (espgensam's hub.h §6). So the dial writes on every detent and
+   must **not** grow its own rate limiter back — that would only add latency. This depends on
+   espgensam `b734fdc` or later; against an older build a fast spin puts a frame on the bus per
+   detent, landing on top of monitor replies.
 2. **`last_write_ms` must be set before calling `target_set_volume`.** That script re-enters
    `on_volume_reported` synchronously, and the reconciler relies on the timestamp to recognise the
    echo as its own. Reordering those two statements causes the arc to fight the user.
@@ -114,8 +116,8 @@ to work on the bench and misbehaves in use.
 6. **An unavailable entity arrives as NAN, and NAN defeats every comparison.** Home Assistant
    sends the literal string `unavailable`, which `HomeassistantNumber` cannot parse, so it
    publishes `NAN`. Every `<`, `>` and `==` against NAN is false, so ordinary guards fail *open*:
-   the reconciler once adopted NAN into `vol_db`, the flusher then saw a permanently dirty value,
-   and the dial wrote `value: "nan"` to Home Assistant every 50 ms. `std::min`/`std::max`
+   the reconciler once adopted NAN into `vol_db`, the write path then saw a permanently dirty
+   value, and the dial wrote `value: "nan"` to Home Assistant every 50 ms. `std::min`/`std::max`
    propagate NAN rather than clamping it away, so it reached the wire intact.
 
    Test `std::isfinite()` explicitly before trusting any value that came from Home Assistant, and
@@ -164,9 +166,10 @@ to work on the bench and misbehaves in use.
   build — use it while iterating on YAML structure.
 - There are no unit tests and no CI. The bring-up sequence in README.md is the functional test
   plan, and its order matters: each failure mode masks the next.
-- **The coalescing acceptance test** cannot be skipped when touching the write path: spin the dial
-  flat out for ten seconds while watching the *controller's* logs, and confirm no monitor goes
-  offline.
+- **The spin acceptance test** cannot be skipped when touching the write path: spin the dial
+  flat out for ten seconds while watching the *controller's* logs. Expect no more than ~20
+  `Set system volume` lines per second, no monitor going offline, and the final value landing
+  when the knob stops.
 
 ---
 
