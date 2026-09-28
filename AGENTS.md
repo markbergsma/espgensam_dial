@@ -24,11 +24,12 @@ packages/board_m5stack_dial.yaml    seam 1: hardware
 packages/target_espgensam_ha.yaml   seam 2: transport
 packages/control.yaml               ── behaviour, transport-agnostic
 packages/ui_volume.yaml             ── presentation, transport-agnostic
+packages/ui_group.yaml              ── presentation, transport-agnostic
 ```
 
 ### Rules
 
-- **`control.yaml` and `ui_volume.yaml` must never name a Home Assistant entity**, call
+- **`control.yaml` and the `ui_*.yaml` packages must never name a Home Assistant entity**, call
   `homeassistant.action`, or reference any `homeassistant`-platform component. If you find
   yourself wanting to, the logic belongs in the transport package.
 - **The board package declares peripherals only.** No volume logic, no HA entities, no LVGL
@@ -45,9 +46,10 @@ A transport package must provide:
 | `target_set_volume(db: float)` | apply an absolute dB value |
 | `target_toggle_mute()` | invert the current mute state |
 | `target_set_power(power_on: bool)` | power the monitors on or off |
+| `target_set_group(name: string)` | apply the named group preset, optimistically |
 
-and must **define** `on_volume_reported(reported)` and `derive_state`, invoking them itself as
-incoming state arrives. It owns these globals:
+It must **define** `derive_state`, and **invoke** it and control's `on_volume_reported(reported)`
+and `on_groups_changed` as incoming state arrives. It owns these globals:
 
 | Global | Meaning |
 |---|---|
@@ -59,13 +61,16 @@ incoming state arrives. It owns these globals:
 | `mute_pending_until_ms` | optimistic mute awaiting confirmation |
 | `sys_state` | a `DialState` value (see `include/dial_state.h`) |
 | `sys_power_off` | media_player reports "off" — the **only** basis for power intent |
+| `group_names` | group preset names in the controlled system's order; empty = no picker |
+| `group_active` | current group name; `""` when unknown |
+| `group_pending_until_ms` | optimistic group choice awaiting confirmation |
 
 `sys_state` and `sys_power_off` answer different questions and must not be conflated. `sys_state`
 is for display and for deciding whether input is accepted; power intent comes from
 `sys_power_off` alone. Deriving power from `sys_state` is what once made a long press send
 `turn_off` to an already-off system, with no way to switch it back on.
 
-`control.yaml` and `ui_volume.yaml` own every other global. They are listed in `control.yaml`
+`control.yaml` and the `ui_*.yaml` packages own every other global. They are listed in `control.yaml`
 under a comment saying so; keep that division visible.
 
 ---
@@ -108,7 +113,7 @@ to work on the bench and misbehaves in use.
 4. **Volume bounds are configurable in espgensam** and differ between its committed config and the
    owner's local one. Never hardcode −80/−30/−25. They are discovered from Home Assistant.
 5. **espgensam's entity schema still churns.** Depend on as few entities as possible — currently
-   three — and always through substitutions. It has added, renamed and removed entities
+   four, the group preset select being optional — and always through substitutions. It has added, renamed and removed entities
    repeatedly (the hub-wide `Audio Source` select is gone; per-monitor `AES3 Channel` became
    `Input`; the crossover number became a select), but `Volume (dB)`, `Bus Status` and the
    `Genelec SAM System` media player have never changed. espgensam's `packages/gensam.yaml`
@@ -127,6 +132,13 @@ to work on the bench and misbehaves in use.
    configured it applies one at every wake and rediscovery, ducking and restoring the master
    volume with broadcast frames only. The dial must keep showing the real target and must not
    try to follow the duck. See the note in `packages/target_espgensam_ha.yaml`.
+8. **The group select confirms a request, not an outcome.** espgensam publishes a chosen group
+   before pushing it, ignores an unknown name without publishing anything (hence the timeout
+   revert, as for mute), and does not notice a group changed from GLM. Its `options` attribute
+   reaches the dial as a Python list repr, which ArduinoJson (ESPHome's `json:`) happens to
+   accept; see `ha_group_options` in the transport. The roller that
+   shows them is loaded through raw `lv_roller_set_options()`; `packages/ui_group.yaml` says why
+   ESPHome's own options API must not be used there.
 
 ---
 

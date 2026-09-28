@@ -31,6 +31,8 @@ fits the thing you do most often at a desk: reach out and turn a knob.
   link are each shown distinctly, using the same colour vocabulary as espgensam's own status LED.
 - **Runtime bounds discovery** — volume min/max/step are read from Home Assistant, so nothing is
   hardcoded and espgensam's configuration can change freely.
+- **Group presets** — switch between the GLM groups espgensam has configured, picked from a
+  list on the screen and confirmed with the button.
 
 ---
 
@@ -42,9 +44,23 @@ fits the thing you do most often at a desk: reach out and turn a knob.
 | Front button | short press | mute / unmute |
 | Front button | long press (≥ 800 ms) | monitors on / off |
 | Screen | tap | wake the backlight only — never changes audio |
+| Group button (bottom of the screen) | tap | open the group picker; if the screen is dimmed, only wake it |
 
-Tapping is deliberately inert beyond waking the screen, so picking the device up or brushing it
-can never change monitor level.
+In the group picker:
+
+| Input | Gesture | Action |
+|---|---|---|
+| Knob | turn | move through the groups |
+| Front button | short press | apply the highlighted group |
+| Front button | long press | cancel |
+| Screen | tap | cancel |
+
+The picker closes on its own after 8 s without input. The picker opens on the group in use.
+Confirming that group again changes nothing.
+
+Only the group button opens the picker; a tap anywhere else just wakes the screen. A tap never
+changes audio by itself. The picker applies nothing until you press the button, so
+picking the device up or brushing it can never change monitor level or switch groups.
 
 The buzzer is **silent on ordinary detents** by default — an 80 dB click per detent in a studio is
 intolerable, and this is a device whose whole job is not making unwanted noise. It sounds only when
@@ -57,12 +73,11 @@ you reach the end of the volume range or when a write is refused. Enable detent 
 
 ```
       ╭───────────────╮        outer ring   volume, 270° sweep
-    ╭─┤    standby    ├─╮      badge        state, blank when plainly active
+    ╭─┤    standby    ├─╮      badge        state; red MUTE when muted and otherwise active
     │ │     -42.5     │ │      large        volume in dB
     │ │       dB      │ │
     ╰─┤      58%      ├─╯      small        equivalent percentage
-      │     MUTE      │        red          only when muted
-      ╰───────────────╯
+      ╰─(Home Cinema)─╯        button       active group preset, if espgensam has groups
 ```
 
 Ring colours are borrowed from espgensam's status LED, with one simplification: espgensam shows
@@ -104,13 +119,15 @@ packages/
   board_m5stack_dial.yaml      HARDWARE ONLY — swap this file for a different dial controller
   target_espgensam_ha.yaml     TRANSPORT — the only file that knows Home Assistant exists
   control.yaml                 input, optimistic state, writes, reconciliation
-  ui_volume.yaml               LVGL fonts, page, repaint
-include/dial_state.h           the DialState vocabulary and its precedence rules
+  ui_volume.yaml               LVGL fonts, volume page, repaint
+  ui_group.yaml                LVGL group preset picker
+include/dial_state.h           the DialState and UiMode vocabulary and their rules
 ```
 
-Two seams, no more. `control.yaml` and `ui_volume.yaml` never name a Home Assistant entity; they
-reach the controlled system only through three scripts (`target_set_volume`, `target_toggle_mute`,
-`target_set_power`) and read its condition only from globals the transport package writes. See
+Two seams, no more. `control.yaml` and the `ui_*.yaml` packages never name a Home Assistant
+entity; they reach the controlled system only through four scripts (`target_set_volume`,
+`target_toggle_mute`, `target_set_power`, `target_set_group`) and read its condition only from
+globals the transport package writes. See
 [AGENTS.md](AGENTS.md) for the full contract.
 
 That is what makes a planned UDP-direct transport a one-file change, and a different dial
@@ -151,12 +168,17 @@ reusing espgensam's.
 ent_volume:     "number.genelec_sam_controller_volume_db"
 ent_media:      "media_player.genelec_sam_system"
 ent_bus_status: "sensor.genelec_sam_controller_bus_status"
+ent_group:      "select.genelec_sam_controller_group_preset"
 ```
 
 Yours will very likely differ. ESPHome derives entity IDs from the device friendly name plus the
 entity name, and either may have been renamed in Home Assistant afterwards — renames stick, so the
-ID can end up looking nothing like the YAML. Check all three in **Developer Tools → States**. A
+ID can end up looking nothing like the YAML. Check all four in **Developer Tools → States**. A
 wrong one makes that value read `unknown` forever, with no error.
+
+`ent_group` is optional. espgensam only has a group preset select if its configuration defines
+groups (`groups:` or `sam_file:`) and declares `group_select: name: "Group Preset"`. Without it
+the dial works as before, and a tap only wakes the screen.
 
 ### 3. Build and flash
 
@@ -172,7 +194,7 @@ then flash the resulting firmware.
 the dial's entry → **Configure** → enable **"Allow the device to perform Home Assistant
 actions"**.
 
-Reading state needs no permission, but *every* write — volume, mute and power alike — goes through
+Reading state needs no permission, but *every* write — volume, mute, power and group alike — goes through
 a Home Assistant action and is gated by this single option. With it off the dial looks like it is
 working: the screen tracks the knob perfectly and reads espgensam's state correctly, but nothing
 ever reaches the monitors.
@@ -202,8 +224,12 @@ the device log shows plainly whether a write was attempted and whether it left t
   purpose: a detent is a *relative* change, so without a known starting point it would jump the
   system to an arbitrary level.
 - **If an entity id is wrong, nothing errors.** Home Assistant simply sends no state, so the value
-  sits empty forever. About 30 s after boot the dial logs a warning naming any of the three that
-  never reported — worth checking for on a first flash.
+  sits empty forever. About 30 s after boot the dial logs a warning naming any of the three
+  required entities that never reported, and an info line if the group select did not — worth
+  checking for on a first flash.
+- **Groups chosen in GLM are not reflected.** espgensam does not see a group switched from
+  Genelec's own software, so neither Home Assistant nor the dial shows it. The dial's group label
+  shows the group espgensam last applied.
 - **The dial depends on Home Assistant.** espgensam itself is autonomous, but an HA-mediated remote
   is not; the dark grey "no link" state makes that visible rather than pretending. A UDP transport
   straight to espgensam is the planned fix.

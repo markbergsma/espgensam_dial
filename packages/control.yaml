@@ -59,6 +59,19 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  # Group preset names in espgensam's own order. Empty means espgensam has no groups, or the list
+  # has not arrived yet; either way there is no picker.
+  - id: group_names
+    type: std::vector<std::string>
+    restore_value: false
+  - id: group_active # current group name; "" when unknown or unavailable
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: group_pending_until_ms # optimistic group choice awaiting confirmation; 0 = none
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
 
   # --- Owned by control / UI ----------------------------------------------------------------
   - id: vol_sent # last value handed to the transport
@@ -97,6 +110,19 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  - id: ui_mode # a UiMode value (see include/dial_state.h)
+    type: int
+    restore_value: false
+    initial_value: "0" # UI_VOLUME
+  - id: picker_index # highlighted row of the group picker; meaningful only while it is open
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Tracks the last backlight script run, so a tap on a dimmed screen can just wake it.
+  - id: backlight_dimmed
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 switch:
   # Audible detent clicks, off by default. An 80 dB buzzer ticking on every detent is intolerable
@@ -127,14 +153,30 @@ sensor:
   - id: !extend dial_encoder
     on_clockwise:
       - script.execute:
-          id: dial_turned
+          id: knob_turned
           dir: 1
     on_anticlockwise:
       - script.execute:
-          id: dial_turned
+          id: knob_turned
           dir: -1
 
 script:
+  # Routes a detent by UI mode. Kept separate from dial_turned so the volume path, and the spin
+  # acceptance test that guards it, are untouched by the picker. Same mode as dial_turned, for the
+  # same reason.
+  - id: knob_turned
+    mode: parallel
+    max_runs: 8
+    parameters:
+      dir: int
+    then:
+      - lambda: |-
+          if (id(ui_mode) == UI_GROUP_PICKER) {
+            id(picker_turned)->execute(dir);
+          } else {
+            id(dial_turned)->execute(dir);
+          }
+
   # ---------------------------------------------------------------------------------------------
   # One detent of the encoder.
   #
@@ -337,9 +379,134 @@ script:
                 then:
                   - rtttl.play: "tick:d=64,o=7,b=220:c"
 
+  # ---------------------------------------------------------------------------------------------
+  # Group picker.
+  #
+  # Opened by a tap on the group button, driven by the knob, confirmed by a short press. Nothing is sent until that
+  # press, because applying a group is not cheap: espgensam pushes routing, crossover, level,
+  # delay and EQ to every monitor and ducks the volume while it does. Browsing past a group must
+  # never apply it.
+  #
+  # Accepted in the same states as mute and power. espgensam also accepts a choice made in standby,
+  # while waking or with no monitors online: it holds the request and pushes it at the next
+  # discovery, where it takes precedence over re-applying the previous group.
+  # ---------------------------------------------------------------------------------------------
+  - id: picker_open
+    then:
+      - if:
+          condition:
+            # A tap on a dimmed screen only wakes it, wherever it lands.
+            lambda: "return id(backlight_dimmed);"
+          then:
+            - script.execute: wake_backlight
+          else:
+            - script.execute: wake_backlight
+            - if:
+                condition:
+                  lambda: |-
+                    return !id(group_names).empty() && id(sys_state) != STATE_DISCONNECTED &&
+                           id(sys_state) != STATE_GLM_LOCKED;
+                then:
+                  - lambda: |-
+                      // Start on the group in use, so an accidental press re-selects it — which
+                      // picker_confirm treats as a no-op.
+                      id(picker_index) = 0;
+                      const auto &names = id(group_names);
+                      for (size_t i = 0; i < names.size(); i++) {
+                        if (names[i] == id(group_active)) {
+                          id(picker_index) = (int) i;
+                          break;
+                        }
+                      }
+                      id(ui_mode) = UI_GROUP_PICKER;
+                  - script.execute: picker_show
+                  - script.execute: picker_timeout
+                else:
+                  - lambda: |-
+                      id(refused_until_ms) = millis() + 700;
+                  - script.execute: ui_refresh
+
+  # No wrap-around: the ends are where the list visibly starts and stops, and the beep on arrival
+  # matches the volume limits.
+  - id: picker_turned
+    parameters:
+      dir: int
+    then:
+      - lambda: |-
+          const int last = std::max((int) id(group_names).size() - 1, 0);
+          const int next = std::min(std::max(id(picker_index) + dir, 0), last);
+          id(at_limit_edge) = (next != id(picker_index)) && (next == 0 || next == last);
+          id(picker_index) = next;
+      - script.execute: wake_backlight
+      - script.execute: picker_repaint
+      - script.execute: feedback_tick
+      - script.execute: picker_timeout
+
+  - id: picker_confirm
+    then:
+      - script.execute: wake_backlight
+      - if:
+          condition:
+            lambda: |-
+              return id(picker_index) >= 0 &&
+                     id(picker_index) < (int) id(group_names).size() &&
+                     id(sys_state) != STATE_DISCONNECTED && id(sys_state) != STATE_GLM_LOCKED;
+          then:
+            - lambda: |-
+                // Confirming the group already in use closes the picker without a write. A
+                // re-push would duck the volume for nothing.
+                const std::string name = id(group_names)[id(picker_index)];
+                if (name != id(group_active)) {
+                  id(target_set_group)->execute(name);
+                }
+          else:
+            - lambda: |-
+                id(refused_until_ms) = millis() + 700;
+      - script.execute: picker_close
+
+  - id: picker_close
+    then:
+      - lambda: |-
+          id(ui_mode) = UI_VOLUME;
+      - script.execute: picker_hide
+      - script.execute: ui_refresh
+
+  # Restarted by every picker input. Never stopped: picker_open restarts it, and a timeout that
+  # fires after the picker has already closed finds nothing to do.
+  - id: picker_timeout
+    mode: restart
+    then:
+      - delay: ${picker_timeout}
+      - if:
+          condition:
+            lambda: "return id(ui_mode) == UI_GROUP_PICKER;"
+          then:
+            - script.execute: picker_close
+
+  # Invoked by the transport whenever it (re)delivers group_names.
+  - id: on_groups_changed
+    then:
+      - if:
+          condition:
+            lambda: "return id(ui_mode) == UI_GROUP_PICKER;"
+          then:
+            - if:
+                condition:
+                  lambda: "return id(group_names).empty();"
+                then:
+                  - script.execute: picker_close
+                else:
+                  - lambda: |-
+                      id(picker_index) =
+                          std::min(id(picker_index), (int) id(group_names).size() - 1);
+                  - script.execute: picker_populate
+      - script.execute: ui_refresh
+
   - id: wake_backlight
     mode: restart
     then:
+      - lambda: |-
+          id(backlight_dimmed) = false;
       - light.turn_on:
           id: display_backlight
           brightness: ${active_brightness}
@@ -347,6 +514,8 @@ script:
   - id: dim_backlight
     mode: restart
     then:
+      - lambda: |-
+          id(backlight_dimmed) = true;
       - light.turn_on:
           id: display_backlight
           brightness: ${idle_brightness}
@@ -362,16 +531,37 @@ interval:
             id(ui_refresh)->execute();
           }
           was_showing = showing;
+      # Close the picker when the system stops accepting a choice while it is open. Polled here
+      # rather than hooked into derive_state, which belongs to the transport.
+      - if:
+          condition:
+            lambda: |-
+              return id(ui_mode) == UI_GROUP_PICKER &&
+                     (id(sys_state) == STATE_DISCONNECTED || id(sys_state) == STATE_GLM_LOCKED);
+          then:
+            - script.execute: picker_close
 
 binary_sensor:
+  # In the group picker a long press cancels rather than powering the system: a user who has
+  # opened a menu is not reaching for the power switch, and must not get it by holding too long.
   - id: !extend front_button
     on_multi_click:
       - timing:
           - ON for at most 500ms
           - OFF for at least 30ms
         then:
-          - script.execute: dial_pressed
+          - lambda: |-
+              if (id(ui_mode) == UI_GROUP_PICKER) {
+                id(picker_confirm)->execute();
+              } else {
+                id(dial_pressed)->execute();
+              }
       - timing:
           - ON for at least 800ms
         then:
-          - script.execute: dial_held
+          - lambda: |-
+              if (id(ui_mode) == UI_GROUP_PICKER) {
+                id(picker_close)->execute();
+              } else {
+                id(dial_held)->execute();
+              }

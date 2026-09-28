@@ -19,14 +19,18 @@ substitutions:
   # YAML. Getting one wrong makes that value read `unknown` forever, with no error.
   #
   # Rather than editing this file, copy espgensam_dial-local.yaml (gitignored) and override the
-  # three substitutions there, the same way espgensam keeps its real serial numbers out of its
+  # four substitutions there, the same way espgensam keeps its real serial numbers out of its
   # committed config.
   #
-  # These three are the only espgensam entities the dial depends on.
+  # These four are the only espgensam entities the dial depends on.
   # ---------------------------------------------------------------------------------------------
   ent_volume: "number.genelec_sam_controller_volume_db"
   ent_media: "media_player.genelec_sam_system"
   ent_bus_status: "sensor.genelec_sam_controller_bus_status"
+  # Optional. espgensam only has this select when its config declares `groups:` (or `sam_file:`)
+  # together with `group_select: name: "Group Preset"`; its committed config does neither. If the
+  # entity never reports, the dial simply has no group picker.
+  ent_group: "select.genelec_sam_controller_group_preset"
 
   # ---------------------------------------------------------------------------------------------
   # Knob feel: accelerated 0.5 dB steps.
@@ -66,6 +70,10 @@ substitutions:
   # Display
   # ---------------------------------------------------------------------------------------------
   idle_timeout: "20s"
+  # The group picker closes by itself after this long without input, so a dial put down with the
+  # picker open goes back to being a volume knob. Long enough to read a handful of names and turn
+  # to one; the idle dim (above) is longer, so the picker never sits on a dimmed screen.
+  picker_timeout: "8s"
   idle_brightness: "0.15"     # dim, never blank — the readout stays legible across the room
   active_brightness: "1.0"
 
@@ -86,6 +94,7 @@ packages:
   target: !include packages/target_espgensam_ha.yaml
   control: !include packages/control.yaml
   ui: !include packages/ui_volume.yaml
+  ui_group: !include packages/ui_group.yaml
 
 wifi:
   ssid: !secret wifi_ssid
@@ -94,6 +103,9 @@ wifi:
     password: !secret ap_password
 
 captive_portal:
+
+# ArduinoJson, used by the transport to decode the group list. See ha_group_options there.
+json:
 
 logger:
   level: INFO

@@ -86,6 +86,24 @@ enum DialState : int {
   STATE_ACTIVE = 5,
 };
 
+/**
+ * @brief What the knob and button currently mean. Unlike DialState this is the dial's own
+ *        condition, not the controlled system's, so it is owned by `packages/control.yaml`.
+ *
+ * The knob means volume except while the group picker is open. The picker is entered only by a
+ * deliberate tap and leaves by itself after `picker_timeout`, so a dial left alone always drifts
+ * back to being a volume knob. Nothing is applied until a button press confirms, which is why a
+ * stray tap can at worst open a picker that then closes unused.
+ */
+enum UiMode : int {
+  /// Knob: volume. Short press: mute. Long press: power.
+  UI_VOLUME = 0,
+
+  /// Knob: move the highlight. Short press: apply the highlighted group. Long press or tap:
+  /// cancel. Power is deliberately unreachable from here.
+  UI_GROUP_PICKER = 1,
+};
+
 }  // namespace espgensam_dial
 
 using espgensam_dial::DialState;
@@ -95,3 +113,6 @@ using espgensam_dial::STATE_GLM_LOCKED;
 using espgensam_dial::STATE_OFFLINE;
 using espgensam_dial::STATE_STANDBY;
 using espgensam_dial::STATE_WAKING;
+using espgensam_dial::UiMode;
+using espgensam_dial::UI_GROUP_PICKER;
+using espgensam_dial::UI_VOLUME;

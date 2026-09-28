@@ -6,9 +6,12 @@
 # ui_volume.yaml.
 #
 # The contract it implements (see AGENTS.md):
-#   provides scripts   target_set_volume(db), target_toggle_mute(), target_set_power(on)
-#   writes globals     vol_db, vol_min, vol_max, vol_step, bounds_known, is_muted, sys_power_off
-#   defines            on_volume_reported(reported), derive_state
+#   provides scripts   target_set_volume(db), target_toggle_mute(), target_set_power(on),
+#                      target_set_group(name)
+#   writes globals     vol_db, vol_min, vol_max, vol_step, bounds_known, is_muted, sys_power_off,
+#                      group_names, group_active, group_pending_until_ms
+#   defines            derive_state
+#   invokes            on_volume_reported(reported), on_groups_changed
 #
 # Group presets and volume ducking (no action needed — documented so it is not "fixed" later):
 # when espgensam has groups configured it pushes one at every wake and rediscovery, ducking the
@@ -18,12 +21,19 @@
 # dial write made mid-push is accepted and published at once but held back from the bus until
 # the push ends, when the closing restore sends it — so turning the knob cannot lift the duck.
 #
-# Only three espgensam entities are used. The 42 per-monitor entities (mute, online, temperature,
-# levels, model/serial/firmware, identify, input routing, crossover, level, delay, calibration
-# bypass) and the group-preset controls are deliberately out of scope — this is a hardware
-# control, not a dashboard. Depending on so few entities is also the best defence against
-# espgensam's still-moving schema: it has added, renamed and removed entities repeatedly, but
-# these three have never changed.
+# Only four espgensam entities are used, and the fourth — the group preset select — is optional.
+# The 42 per-monitor entities (mute, online, temperature, levels, model/serial/firmware,
+# identify, input routing, crossover, level, delay, calibration bypass) and the other group
+# controls (Group Modified, Bypass Calibration) are deliberately out of scope — this is a
+# hardware control, not a dashboard. Depending on so few entities is also the best defence
+# against espgensam's still-moving schema: it has added, renamed and removed entities
+# repeatedly, but Volume (dB), Bus Status and the media player have never changed.
+#
+# The group select is read twice: its state is the current group, its `options` attribute the
+# list. espgensam publishes a requested group at once, before the push has happened, and
+# silently ignores a name it does not know, so the dial treats the state as confirmation of the
+# request and nothing more. A group changed from GLM itself is not seen by espgensam, so it is
+# not seen here either.
 
 number:
   # READ-ONLY bridge to espgensam's "Volume (dB)". Writes go through target_set_volume, which
@@ -95,6 +105,56 @@ text_sensor:
     on_value:
       - script.execute: derive_state
 
+  # Current group preset. Arrives as "unavailable" when espgensam drops off Home Assistant, and
+  # as "unknown" before espgensam has published one (listen-only mode, or `default_group: none`
+  # before anything was chosen).
+  - platform: homeassistant
+    id: ha_group
+    entity_id: ${ent_group}
+    on_value:
+      - lambda: |-
+          id(group_active) = (x == "unavailable" || x == "unknown") ? std::string() : x;
+          id(group_pending_until_ms) = 0;  // confirmed by the source of truth
+      - script.execute: ui_refresh
+
+  # The group list, as the select's `options` attribute. Home Assistant forwards non-boolean
+  # attributes as Python's str() of the value, so a list arrives as its repr():
+  #     ['Home Cinema', "Rob's Mix", 'Flat']
+  # That is not JSON, but ArduinoJson accepts single-quoted strings and the `\'` escape, which
+  # covers everything repr() writes for a group name except `\xNN` (used only for control
+  # characters). Parsing is all-or-nothing: a partial list would put the wrong name at an
+  # index, whereas an empty one just means no picker.
+  #
+  # When the select goes unavailable the attribute disappears and this holds its last value,
+  # which is harmless: sys_state then refuses the picker anyway.
+  - platform: homeassistant
+    id: ha_group_options
+    entity_id: ${ent_group}
+    attribute: options
+    on_value:
+      - lambda: |-
+          std::vector<std::string> names;
+          JsonDocument doc;
+          const bool ok = !deserializeJson(doc, x) && doc.is<JsonArray>();
+          if (ok) {
+            for (JsonVariant v : doc.as<JsonArray>()) {
+              if (!v.is<const char *>()) {
+                names.clear();
+                break;
+              }
+              names.emplace_back(v.as<const char *>());
+            }
+          }
+          if (names.empty() && x != "[]") {
+            ESP_LOGW("dial", "could not parse the group list from '%s': %s", "${ent_group}",
+                     x.c_str());
+          }
+          if (names != id(group_names)) {
+            ESP_LOGI("dial", "%u group presets from HA", (unsigned) names.size());
+            id(group_names) = std::move(names);
+          }
+      - script.execute: on_groups_changed
+
 binary_sensor:
   # Mute is an attribute of the media_player, not an entity of its own — espgensam has no
   # hub-level mute switch. Reading a boolean attribute is safe because Home Assistant converts
@@ -146,6 +206,11 @@ interval:
           if (id(ha_bus_status)->state.empty()) {
             ESP_LOGW("dial", "no state from '%s' - check the entity id", "${ent_bus_status}");
           }
+          // Not a warning: groups are optional in espgensam, and its committed config has none.
+          if (id(ha_group)->state.empty()) {
+            ESP_LOGI("dial", "no state from '%s' - no group picker (check the id if espgensam "
+                     "has groups)", "${ent_group}");
+          }
 
   # Expire an unconfirmed optimistic mute, snapping the screen back to what Home Assistant
   # actually reports.
@@ -160,6 +225,25 @@ interval:
           if (actual != id(is_muted)) {
             ESP_LOGW("dial", "mute not confirmed; reverting to %s", actual ? "on" : "off");
             id(is_muted) = actual;
+            id(refused_until_ms) = millis() + 700;
+            id(ui_refresh)->execute();
+          }
+
+  # The same safety net for an optimistic group choice. ha_group fires only when the state
+  # changes, and espgensam publishes nothing for a name it rejects, so a lost write would
+  # otherwise leave the wrong group on screen.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(group_pending_until_ms) == 0 || millis() < id(group_pending_until_ms)) {
+            return;
+          }
+          id(group_pending_until_ms) = 0;
+          const std::string &s = id(ha_group)->state;
+          const std::string actual = (s == "unavailable" || s == "unknown") ? std::string() : s;
+          if (actual != id(group_active)) {
+            ESP_LOGW("dial", "group not confirmed; reverting to '%s'", actual.c_str());
+            id(group_active) = actual;
             id(refused_until_ms) = millis() + 700;
             id(ui_refresh)->execute();
           }
@@ -235,6 +319,22 @@ script:
             entity_id: ${ent_media}
       - lambda: |-
           ESP_LOGI("dial", "write: power -> %s", power_on ? "on" : "off");
+
+  # Optimistic like mute, and for the same reason; the interval above reverts it if Home
+  # Assistant does not confirm in time.
+  - id: target_set_group
+    parameters:
+      name: string
+    then:
+      - homeassistant.action:
+          action: select.select_option
+          data:
+            entity_id: ${ent_group}
+            option: !lambda "return name;"
+      - lambda: |-
+          ESP_LOGI("dial", "write: group -> '%s'", name.c_str());
+          id(group_active) = name;
+          id(group_pending_until_ms) = millis() + ${reconcile_grace};
 
   # Promote the three attributes to a usable scale once all of them have arrived and agree.
   - id: bounds_check

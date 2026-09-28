@@ -1,0 +1,124 @@
+# UI: the group preset picker.
+#
+# Like ui_volume.yaml, this package must never name a Home Assistant entity. It renders
+# group_names, group_active and picker_index; control.yaml decides when it is shown.
+#
+# A roller rather than a list or a dropdown: on a round panel only a few rows centred on the
+# middle are fully visible anyway, and a roller keeps the highlighted row in the one place that
+# is never clipped by the bezel. It is driven by the knob alone. It is not clickable, and a
+# transparent button covers the whole page, so a touch can neither scroll it nor pick a row. A tap
+# cancels, and only a button press applies.
+
+font:
+  - file: "gfonts://Rubik@500"
+    id: font_group
+    size: 22
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+lvgl:
+  pages:
+    - id: page_group
+      bg_color: 0x000000
+      pad_all: 0
+      widgets:
+        - label:
+            id: picker_title
+            align: CENTER
+            y: -72
+            text: "Group"
+            text_font: font_small
+            text_color: 0x8A8A8A
+
+        # 200 px is the panel's width at the outer rows' height (±~40 px). Longer names are
+        # clipped; GLM group names are short in practice.
+        - roller:
+            id: group_roller
+            align: CENTER
+            width: 200
+            visible_row_count: 3
+            mode: NORMAL
+            # Placeholder only. The real options are set at runtime by picker_populate; see the
+            # comment there for why this is not `lvgl.roller.update: options:`.
+            options: ["-"]
+            clickable: false
+            text_font: font_group
+            text_color: 0x6A6A6A
+            text_align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            selected:
+              text_color: 0xFFFFFF
+              bg_color: 0x1A1A1A
+              bg_opa: COVER
+
+        - label:
+            id: picker_hint
+            align: CENTER
+            y: 72
+            text: ""
+            text_font: font_small
+            text_color: 0x8A8A8A
+
+        # On top of everything else, so it takes every touch on this page.
+        - button:
+            id: picker_touch_overlay
+            align: CENTER
+            width: 240
+            height: 240
+            bg_opa: 0%
+            border_width: 0
+            shadow_width: 0
+            on_short_click:
+              - script.execute: picker_close
+
+script:
+  - id: picker_show
+    then:
+      - script.execute: picker_populate
+      - lvgl.page.show: page_group
+
+  - id: picker_hide
+    then:
+      - lvgl.page.show: page_volume
+
+  # Loads group_names into the roller and puts the highlight on picker_index without animating.
+  #
+  # Deliberately raw LVGL rather than `lvgl.roller.update: options:`. ESPHome's
+  # LvSelectable::set_options() keeps the `const char *` pointers it is given, and it does not
+  # copy the strings they point at. Pointers into group_names would dangle as soon as the
+  # transport replaced that vector. lv_roller_set_options() copies the joined string into LVGL's
+  # own memory. The price is that the widget's ESPHome-side option list stays the static
+  # placeholder above, so nothing may read it back (get_selected_text() and friends); the
+  # selection is tracked in picker_index instead.
+  - id: picker_populate
+    then:
+      - lambda: |-
+          std::string opts;
+          for (const auto &name : id(group_names)) {
+            if (!opts.empty()) {
+              opts += '\n';
+            }
+            // A newline inside a name would split it into two rows and shift every index after it.
+            for (char c : name) {
+              opts += (c == '\n') ? ' ' : c;
+            }
+          }
+          lv_roller_set_options(id(group_roller)->obj, opts.c_str(), LV_ROLLER_MODE_NORMAL);
+          lv_roller_set_selected(id(group_roller)->obj, id(picker_index), LV_ANIM_OFF);
+      - script.execute: picker_repaint
+
+  - id: picker_repaint
+    then:
+      - lvgl.roller.update:
+          id: group_roller
+          selected_index: !lambda "return id(picker_index);"
+          animated: true
+      - lvgl.label.update:
+          id: picker_hint
+          text: !lambda |-
+            const auto &names = id(group_names);
+            const int i = id(picker_index);
+            const bool current =
+                i >= 0 && i < (int) names.size() && names[i] == id(group_active);
+            return std::string(current ? "current" : "press to apply");
