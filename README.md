@@ -4,13 +4,12 @@
 into a physical remote control — primarily a volume knob — for a Genelec SAM monitor system driven
 by [`espgensam`](https://github.com/markbergsma/espgensam).
 
-Turning the knob moves the on-screen volume instantly; the monitors follow within a few tens of milliseconds. The
-round display shows the level in dB, the equivalent percentage, and the condition of the system at
-a glance.
+Turning the knob changes volume; the round display shows the level in dB, the equivalent percentage,
+and the condition of the system at a glance.
 
 ---
 
-## Why this exists
+## Purpose
 
 `espgensam` already exposes a Genelec SAM system to Home Assistant over the GLM RS-485 bus. But the
 only ways to change volume were a Home Assistant slider and Genelec's own GLM software, and neither
@@ -21,8 +20,7 @@ fits the thing you do most often at a desk: reach out and turn a knob.
 ## Features
 
 - **Accelerated volume knob** — 0.5 dB per detent when turning slowly for fine trim, scaling to
-  3 dB per detent on a fast spin, so the full −80…−25 dB range is under three revolutions instead
-  of seven.
+  3 dB per detent on a fast spin, so the full −80…−25 dB range is under three revolutions.
 - **Zero-latency display** — the arc and readout update from local state on the detent itself, not
   after a network round trip.
 - **Live tracking** — the monitors follow the knob during a spin, not just when it stops (see
@@ -61,11 +59,6 @@ Confirming that group again changes nothing.
 Only the group button opens the picker; a tap anywhere else just wakes the screen. A tap never
 changes audio by itself. The picker applies nothing until you press the button, so
 picking the device up or brushing it can never change monitor level or switch groups.
-
-The buzzer is **silent on ordinary detents** by default — an 80 dB click per detent in a studio is
-intolerable, and this is a device whose whole job is not making unwanted noise. It sounds only when
-you reach the end of the volume range or when a write is refused. Enable detent clicks with the
-"Click feedback" switch in Home Assistant if you want them.
 
 ---
 
@@ -124,7 +117,7 @@ packages/
 include/dial_state.h           the DialState and UiMode vocabulary and their rules
 ```
 
-Two seams, no more. `control.yaml` and the `ui_*.yaml` packages never name a Home Assistant
+Two seams: `control.yaml` and the `ui_*.yaml` packages never name a Home Assistant
 entity; they reach the controlled system only through four scripts (`target_set_volume`,
 `target_toggle_mute`, `target_set_power`, `target_set_group`) and read its condition only from
 globals the transport package writes. See
@@ -138,8 +131,7 @@ controller a one-file change in the other direction.
 The dial updates its own display on every detent and sends each new value straight to Home
 Assistant. It does not pace itself: espgensam coalesces volume requests and sends them to the
 monitors between telemetry polls, at most every 50 ms by default (its `volume_tx_interval`), so a
-fast spin cannot disturb the RS-485 bus. **This needs an espgensam build that includes that
-pacing**; older ones transmit every request immediately.
+fast spin cannot disturb the RS-485 bus.
 
 A reconciler then has to tell three things apart: the echo of the dial's own write, a stale value
 arriving while the user is still turning, and a genuine external change (a Home Assistant slider,
@@ -227,9 +219,6 @@ the device log shows plainly whether a write was attempted and whether it left t
   sits empty forever. About 30 s after boot the dial logs a warning naming any of the three
   required entities that never reported, and an info line if the group select did not — worth
   checking for on a first flash.
-- **Groups chosen in GLM are not reflected.** espgensam does not see a group switched from
-  Genelec's own software, so neither Home Assistant nor the dial shows it. The dial's group label
-  shows the group espgensam last applied.
 - **The dial depends on Home Assistant.** espgensam itself is autonomous, but an HA-mediated remote
   is not; the dark grey "no link" state makes that visible rather than pretending. A UDP transport
   straight to espgensam is the planned fix.
