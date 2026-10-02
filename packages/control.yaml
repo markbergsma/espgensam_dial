@@ -106,6 +106,18 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+  # The readout strings, formatted once per repaint. ui_refresh assigns them to the primary and
+  # secondary labels according to primary_readout.
+  - id: ui_db_text
+    type: std::string
+    restore_value: false
+  - id: ui_pct_text
+    type: std::string
+    restore_value: false
+  - id: ui_secondary_shown # the secondary readout is visible; see secondary_hold
+    type: bool
+    restore_value: false
+    initial_value: "false"
   - id: refused_until_ms # amber "write refused" pulse expiry
     type: uint32_t
     restore_value: false
@@ -521,16 +533,19 @@ script:
           brightness: ${idle_brightness}
 
 interval:
-  # Expire the amber "refused" pulse.
+  # Expire the amber "refused" pulse, and hide the secondary readout once secondary_hold has
+  # passed since the last detent.
   - interval: 250ms
     then:
       - lambda: |-
-          static bool was_showing = false;
-          const bool showing = millis() < id(refused_until_ms);
-          if (was_showing && !showing) {
+          static bool was_refusing = false;
+          const bool refusing = millis() < id(refused_until_ms);
+          const bool secondary_expired = id(ui_secondary_shown) &&
+              (millis() - id(last_local_change_ms)) >= ${secondary_hold};
+          if ((was_refusing && !refusing) || secondary_expired) {
             id(ui_refresh)->execute();
           }
-          was_showing = showing;
+          was_refusing = refusing;
       # Close the picker when the system stops accepting a choice while it is open. Polled here
       # rather than hooked into derive_state, which belongs to the transport.
       - if:

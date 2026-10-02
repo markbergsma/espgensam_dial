@@ -69,6 +69,10 @@ substitutions:
   # ---------------------------------------------------------------------------------------------
   # Display
   # ---------------------------------------------------------------------------------------------
+  # Which value is the large number: "db" or "percent". The other one appears small underneath
+  # only while the knob is turning, and disappears secondary_hold ms after the last detent.
+  primary_readout: "db"
+  secondary_hold: "1500"
   idle_timeout: "20s"
   # The group picker closes by itself after this long without input, so a dial put down with the
   # picker open goes back to being a volume knob. Long enough to read a handful of names and turn

@@ -6,12 +6,16 @@
 # Layout notes for the 240x240 round panel: the bezel eats the corners, so everything meaningful
 # lives inside a ~200 px safe circle and every element is centre-aligned with a vertical offset.
 # The vertical offsets were chosen so the readout stays legible across a room; they are the most
-# likely thing to want nudging on the bench. A near-black monitor silhouette sits behind the
+# likely thing to want nudging on the bench.
+#
+# One value is the readout and the other only a hint while turning: primary_readout picks which of
+# dB and percentage is the large number, and the other shows small underneath for secondary_hold
+# after each detent. Both at all times was too busy. A near-black monitor silhouette sits behind the
 # readout as decoration; see its comment in page_volume.
 #
 # The ring colour answers one question: is the level shown the level you hear? The status badge
 # says why when it is not. See ui_refresh for the precedence.
-#   - green: live. The same test as the white dB number: STATE_ACTIVE and not muted.
+#   - green: live. The same test as the white primary number: STATE_ACTIVE and not muted.
 #   - dim green: held. Standby, waking or no monitors. The level is kept but not heard.
 #   - red: muted, in any state that accepts input. This is the Genelec monitors' own mute colour:
 #     their status LED goes solid red when muted.
@@ -37,7 +41,8 @@ font:
     id: font_pct
     size: 22
     bpp: 4
-    glyphs: "-0123456789%"
+    # Also carries the dB value when it is secondary ("-42.5 dB").
+    glyphs: "-.0123456789% dB"
   - file: "gfonts://Rubik"
     id: font_small
     size: 16
@@ -94,7 +99,7 @@ lvgl:
         # above black, so the silhouette all but disappears when the backlight dims.
         #
         # The cabinet spans y -76..+64, inside the ring's ~97 px inner radius and clear of the
-        # group button below. The woofer sits behind the dB number, the tweeter behind the badge.
+        # group button below. The woofer sits behind the large number, the tweeter behind the badge.
         - image:
             id: spk_silhouette
             src: monitor_silhouette
@@ -141,9 +146,9 @@ lvgl:
             text_font: font_small
             text_color: 0xF59E0B
 
-        # Primary readout: dB.
+        # Primary readout: dB or percentage, per primary_readout. Its unit goes underneath.
         - label:
-            id: vol_label
+            id: primary_label
             align: CENTER
             y: -18
             text: "--.-"
@@ -158,13 +163,15 @@ lvgl:
             text_font: font_small
             text_color: 0x8A8A8A
 
-        # Secondary readout: percentage, matching the 0..1 scale Home Assistant's media_player
-        # shows. See ui_refresh for why this is computed locally rather than read back.
+        # Secondary readout: the other value, shown only while the knob is turning. The percentage
+        # matches the 0..1 scale Home Assistant's media_player shows. See ui_refresh for why it is
+        # computed locally rather than read back.
         - label:
-            id: pct_label
+            id: secondary_label
             align: CENTER
             y: 46
-            text: "--%"
+            hidden: true
+            text: ""
             text_font: font_pct
             text_color: 0xA8A8A8
 
@@ -236,7 +243,7 @@ script:
   # the number entity reports (volume_db_to_slider() in components/gensam/util.h), so the
   # percentage is arithmetically identical to the normalized arc position. Computing it locally
   # keeps it in the same instant as the arc and the dB number; reading it back would make it visibly
-  # lag the value it sits directly beneath, which looks broken.
+  # lag the value it sits beside, which looks broken.
   #
   # Note 0% here means vol_min (-80 dB), not silence: espgensam treats only slider <= 0.001 as true
   # silence (-130 dB), and that case is unreachable coming from dB.
@@ -260,29 +267,54 @@ script:
             id(ui_arc_pos) = 0;
           }
 
+          // Until Home Assistant reports a usable value there is no honest number to show.
+          // The placeholder vol_db started from is not one.
+          char buf[12];
+          if (!id(volume_known) || !std::isfinite(id(vol_db))) {
+            id(ui_db_text) = "--.-";
+          } else {
+            snprintf(buf, sizeof(buf), "%.1f", id(vol_db));
+            id(ui_db_text) = buf;
+          }
+          if (!id(volume_known) || !id(bounds_known)) {
+            id(ui_pct_text) = "--";
+          } else {
+            snprintf(buf, sizeof(buf), "%d", (int) lroundf(id(ui_arc_pos) / 10.0f));
+            id(ui_pct_text) = buf;
+          }
+
+          // Only an accepted detent sets last_local_change_ms, so a refused turn or a change made
+          // elsewhere (a Home Assistant slider, GLM) never shows the secondary. 0 means none yet.
+          id(ui_secondary_shown) = id(last_local_change_ms) != 0 &&
+              (millis() - id(last_local_change_ms)) < ${secondary_hold};
+
       - lvgl.arc.update:
           id: vol_arc
           value: !lambda "return id(ui_arc_pos);"
 
       - lvgl.label.update:
-          id: vol_label
+          id: primary_label
           text: !lambda |-
-            // Until Home Assistant reports a usable value there is no honest number to show.
-            // The placeholder vol_db started from is not one.
-            if (!id(volume_known) || !std::isfinite(id(vol_db))) {
-              return std::string("--.-");
-            }
-            char buf[10];
-            snprintf(buf, sizeof(buf), "%.1f", id(vol_db));
-            return std::string(buf);
+            constexpr std::string_view kPrimary = "${primary_readout}";
+            static_assert(kPrimary == "db" || kPrimary == "percent",
+                          "primary_readout must be \"db\" or \"percent\"");
+            return kPrimary == "percent" ? id(ui_pct_text) : id(ui_db_text);
 
       - lvgl.label.update:
-          id: pct_label
+          id: unit_label
           text: !lambda |-
-            if (!id(volume_known) || !id(bounds_known)) return std::string("--%");
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d%%", (int) lroundf(id(ui_arc_pos) / 10.0f));
-            return std::string(buf);
+            constexpr std::string_view kPrimary = "${primary_readout}";
+            return std::string(kPrimary == "percent" ? "%" : "dB");
+
+      - lvgl.label.update:
+          id: secondary_label
+          text: !lambda |-
+            constexpr std::string_view kPrimary = "${primary_readout}";
+            return kPrimary == "percent" ? id(ui_db_text) + " dB" : id(ui_pct_text) + "%";
+
+      - lvgl.widget.update:
+          id: secondary_label
+          hidden: !lambda "return !id(ui_secondary_shown);"
 
       # Ring colour. See the file comment for what each colour means. No control comes before mute,
       # because a mute state is meaningless or stale when nothing can be controlled.
@@ -299,16 +331,16 @@ script:
               if (s != STATE_ACTIVE) return lv_color_hex(0x116633);    // dim green, held
               return lv_color_hex(0x22C55E);                           // green, live
 
-      # The dB number dims whenever the value is not currently audible.
+      # The primary number dims whenever the value is not currently audible.
       - lvgl.label.update:
-          id: vol_label
+          id: primary_label
           text_color: !lambda |-
             const bool live = (id(sys_state) == STATE_ACTIVE) && !id(is_muted);
             return live ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x777777);
 
       # One badge for state and mute. A state word wins over MUTE. When muted, the ring turns red in
       # every state that accepts input, so the word is then the only thing saying what the state
-      # is, whereas the red ring and dimmed dB number still say "muted" on their own.
+      # is, whereas the red ring and dimmed primary number still say "muted" on their own.
       - lvgl.label.update:
           id: status_label
           text: !lambda |-

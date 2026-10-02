@@ -4,8 +4,8 @@
 into a physical remote control — primarily a volume knob — for a Genelec SAM monitor system driven
 by [`espgensam`](https://github.com/markbergsma/espgensam).
 
-Turning the knob changes volume; the round display shows the level in dB, the equivalent percentage,
-and the condition of the system at a glance.
+Turning the knob changes volume; the round display shows the level, in dB or as a percentage, and
+the condition of the system at a glance.
 
 ---
 
@@ -67,14 +67,17 @@ picking the device up or brushing it can never change monitor level or switch gr
 ```
       ╭───────────────╮        outer ring   volume, 270° sweep
     ╭─┤    standby    ├─╮      badge        state; red MUTE when muted and otherwise active
-    │ │     -42.5     │ │      large        volume in dB
+    │ │     -42.5     │ │      large        volume in dB (or percentage)
     │ │       dB      │ │
-    ╰─┤      58%      ├─╯      small        equivalent percentage
+    ╰─┤      58%      ├─╯      small        the other value, only while turning
       ╰─(Home Cinema)─╯        button       active group preset, if espgensam has groups
 ```
 
 The knob is refused while Genelec's GLM adapter owns the bus or the Home Assistant link is down,
 and the badge says which. In standby a turn still sets the level, ready for power-on.
+
+`primary_readout` in `espgensam_dial.yaml` chooses whether the large number is dB (`db`, the
+default) or the percentage (`percent`).
 
 After 20 s idle the backlight dims but never blanks, so the level stays readable across the room.
 
