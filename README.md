@@ -25,8 +25,8 @@ fits the thing you do most often at a desk: reach out and turn a knob.
   after a network round trip.
 - **Live tracking** — the monitors follow the knob during a spin, not just when it stops (see
   [How volume changes reach the monitors](#how-volume-changes-reach-the-monitors)).
-- **Honest state** — GLM bus lockout, standby, wake-up progress and loss of the Home Assistant
-  link are each shown distinctly, using the same colour vocabulary as espgensam's own status LED.
+- **Honest state** — the ring shows at a glance whether the level is the one you hear, and the
+  badge says why not: GLM bus lockout, standby, wake-up progress or loss of the Home Assistant link.
 - **Runtime bounds discovery** — volume min/max/step are read from Home Assistant, so nothing is
   hardcoded and espgensam's configuration can change freely.
 - **Group presets** — switch between the GLM groups espgensam has configured, picked from a
@@ -73,19 +73,8 @@ picking the device up or brushing it can never change monitor level or switch gr
       ╰─(Home Cinema)─╯        button       active group preset, if espgensam has groups
 ```
 
-Ring colours are borrowed from espgensam's status LED, with one simplification: espgensam shows
-discovering and configuring as separate colours, while the dial shows a single "waking" cyan.
-Note that the Waveshare controller has no RGB LED at all, so on that board the dial is the only
-status indicator rather than a second opinion.
-
-| Colour | Meaning | Knob |
-|---|---|---|
-| green | active | works |
-| dim green | standby — level is stored, applied on power-up | works |
-| cyan | waking (discovering / configuring) | works |
-| amber | Genelec's GLM adapter owns the bus | **refused** |
-| dim white | powered on, but no monitors found | works, inaudible |
-| dark grey | no Home Assistant link | **refused** |
+The knob is refused while Genelec's GLM adapter owns the bus or the Home Assistant link is down,
+and the badge says which. In standby a turn still sets the level, ready for power-on.
 
 After 20 s idle the backlight dims but never blanks, so the level stays readable across the room.
 
@@ -220,7 +209,7 @@ the device log shows plainly whether a write was attempted and whether it left t
   required entities that never reported, and an info line if the group select did not — worth
   checking for on a first flash.
 - **The dial depends on Home Assistant.** espgensam itself is autonomous, but an HA-mediated remote
-  is not; the dark grey "no link" state makes that visible rather than pretending. A UDP transport
+  is not; the empty ring and "no link" badge make that visible rather than pretending. A UDP transport
   straight to espgensam is the planned fix.
 
 ---

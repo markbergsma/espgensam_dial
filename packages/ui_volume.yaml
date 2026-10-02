@@ -8,16 +8,21 @@
 # The vertical offsets were chosen so the readout stays legible across a room; they are the most
 # likely thing to want nudging on the bench.
 #
-# Colour vocabulary is borrowed from espgensam's own status LED (components/gensam/status_led.cpp):
-#   Active green / GLM Active amber / waking cyan / Standby dim green / Offline dim white.
+# The ring colour answers one question: is the level shown the level you hear? The status badge
+# says why when it is not. See ui_refresh for the precedence.
+#   - green: live. The same test as the white dB number: STATE_ACTIVE and not muted.
+#   - dim green: held. Standby, waking or no monitors. The level is kept but not heard.
+#   - red: muted, in any state that accepts input. This is the Genelec monitors' own mute colour:
+#     their status LED goes solid red when muted.
+#   - empty: no control (no link, or GLM owns the bus). The indicator takes the track colour.
+#   - amber: input refused. Only as a short pulse in reaction to a knob turn, never steady.
 #
-# Two deliberate departures from that LED, so do not "restore" them:
-#   - espgensam distinguishes Discovering (blue) from Configuring (cyan). The dial collapses both
-#     into STATE_WAKING and shows one cyan, because the difference is an internal phase of the
-#     RACE cycle and means nothing to someone holding a volume knob.
-#   - The two are not guaranteed to be side by side anyway: the Waveshare controller has no RGB
-#     LED and therefore no status_led at all, so on that board this is the only status indicator
-#     rather than a second opinion.
+# Mute needs its own colour, separate from held, because the badge shows a state word in
+# preference to MUTE. In standby, waking or offline the ring is then the only sign of mute.
+#
+# The bus phases deliberately have no colours of their own. This palette once copied espgensam's
+# status LED. Bus status is an internal detail, and most controller boards have no RGB LED to
+# match, so the badge words carry the phase instead. Do not restore per-phase colours.
 
 font:
   # Glyph subsetting keeps compile time and RAM down. Flash is 8 MB so the fonts themselves are
@@ -251,21 +256,20 @@ script:
             snprintf(buf, sizeof(buf), "%d%%", (int) lroundf(id(ui_arc_pos) / 10.0f));
             return std::string(buf);
 
-      # Ring colour: the refusal pulse overrides everything, then the system state.
+      # Ring colour. See the file comment for what each colour means. No control comes before mute,
+      # because a mute state is meaningless or stale when nothing can be controlled.
       - lvgl.arc.update:
           id: vol_arc
           indicator:
             arc_color: !lambda |-
               if (millis() < id(refused_until_ms)) return lv_color_hex(0xF59E0B);  // amber
-              if (id(is_muted)) return lv_color_hex(0x555555);
-              switch (id(sys_state)) {
-                case STATE_DISCONNECTED: return lv_color_hex(0x3A3A3A);
-                case STATE_GLM_LOCKED:   return lv_color_hex(0xF59E0B);
-                case STATE_WAKING:       return lv_color_hex(0x00CCFF);  // cyan, configuring
-                case STATE_OFFLINE:      return lv_color_hex(0x6A6A6A);  // dim white
-                case STATE_STANDBY:      return lv_color_hex(0x116633);  // dim green
-                default:                 return lv_color_hex(0x22C55E);  // green
+              const int s = id(sys_state);
+              if (s == STATE_DISCONNECTED || s == STATE_GLM_LOCKED) {
+                return lv_color_hex(0x1A1A1A);  // the track colour, so the ring reads as empty
               }
+              if (id(is_muted)) return lv_color_hex(0xDC2626);         // red
+              if (s != STATE_ACTIVE) return lv_color_hex(0x116633);    // dim green, held
+              return lv_color_hex(0x22C55E);                           // green, live
 
       # The dB number dims whenever the value is not currently audible.
       - lvgl.label.update:
@@ -274,9 +278,9 @@ script:
             const bool live = (id(sys_state) == STATE_ACTIVE) && !id(is_muted);
             return live ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x777777);
 
-      # One badge for state and mute. A state word wins over MUTE: when muted the ring turns grey
-      # whatever the state, so the word is then the only thing saying what the state is, whereas
-      # the grey ring and dimmed dB number still say "muted" on their own.
+      # One badge for state and mute. A state word wins over MUTE. When muted, the ring turns red in
+      # every state that accepts input, so the word is then the only thing saying what the state
+      # is, whereas the red ring and dimmed dB number still say "muted" on their own.
       - lvgl.label.update:
           id: status_label
           text: !lambda |-
@@ -293,7 +297,7 @@ script:
           text_color: !lambda |-
             const bool mute_shown = millis() >= id(refused_until_ms) &&
                                     id(sys_state) == STATE_ACTIVE && id(is_muted);
-            return mute_shown ? lv_color_hex(0xEF4444) : lv_color_hex(0xF59E0B);
+            return mute_shown ? lv_color_hex(0xDC2626) : lv_color_hex(0xF59E0B);
 
       - lvgl.widget.update:
           id: group_button
