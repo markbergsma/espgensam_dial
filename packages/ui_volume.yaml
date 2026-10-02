@@ -6,7 +6,8 @@
 # Layout notes for the 240x240 round panel: the bezel eats the corners, so everything meaningful
 # lives inside a ~200 px safe circle and every element is centre-aligned with a vertical offset.
 # The vertical offsets were chosen so the readout stays legible across a room; they are the most
-# likely thing to want nudging on the bench.
+# likely thing to want nudging on the bench. A near-black monitor silhouette sits behind the
+# readout as decoration; see its comment in page_volume.
 #
 # The ring colour answers one question: is the level shown the level you hear? The status badge
 # says why when it is not. See ui_refresh for the precedence.
@@ -46,6 +47,15 @@ font:
     # subset of known words.
     glyphsets: [GF_Latin_Core]
 
+# The background silhouette. An alpha mask, which LVGL stores as A8 and paints in the widget's
+# image_recolor colour, so its colour is set on the widget below.
+image:
+  - platform: file
+    file: images/monitor_silhouette.png
+    id: monitor_silhouette
+    type: GRAYSCALE
+    transparency: alpha_channel
+
 lvgl:
   displays: [round_display]
   touchscreens: [touch]
@@ -76,6 +86,24 @@ lvgl:
       bg_color: 0x000000
       pad_all: 0
       widgets:
+        # Background art: a studio monitor silhouette in the Genelec cabinet shape, with tweeter,
+        # woofer and LED dot cut out. Pure decoration that never shows state; the ring and badge do
+        # that. It comes first so it is drawn behind everything else.
+        #
+        # The image is an alpha mask, so the colour is set here. 0x101010 is deliberately only just
+        # above black, so the silhouette all but disappears when the backlight dims.
+        #
+        # The cabinet spans y -76..+64, inside the ring's ~97 px inner radius and clear of the
+        # group button below. The woofer sits behind the dB number, the tweeter behind the badge.
+        - image:
+            id: spk_silhouette
+            src: monitor_silhouette
+            align: CENTER
+            y: -6
+            image_recolor: 0x101010
+            image_recolor_opa: COVER
+            clickable: false
+
         # The volume ring. 270 degrees of sweep with the gap at the bottom, which is where the
         # hand covers the screen anyway.
         - arc:
