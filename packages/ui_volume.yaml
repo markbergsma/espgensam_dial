@@ -16,7 +16,8 @@
 # The ring colour answers one question: is the level shown the level you hear? The status badge
 # says why when it is not. See ui_refresh for the precedence.
 #   - green: live. The same test as the white primary number: STATE_ACTIVE and not muted.
-#   - dim green: held. Standby, waking or no monitors. The level is kept but not heard.
+#   - dim grey: held. Standby, waking or no monitors. The level is kept but not heard. Green is
+#     kept for live only, so the monitors being off never reads as "on".
 #   - red: muted, in any state that accepts input. This is the Genelec monitors' own mute colour:
 #     their status LED goes solid red when muted.
 #   - empty: no control (no link, or GLM owns the bus). The indicator takes the track colour.
@@ -328,7 +329,7 @@ script:
                 return lv_color_hex(0x1A1A1A);  // the track colour, so the ring reads as empty
               }
               if (id(is_muted)) return lv_color_hex(0xDC2626);         // red
-              if (s != STATE_ACTIVE) return lv_color_hex(0x116633);    // dim green, held
+              if (s != STATE_ACTIVE) return lv_color_hex(0x4A4A4A);    // dim grey, held
               return lv_color_hex(0x22C55E);                           // green, live
 
       # The primary number dims whenever the value is not currently audible.
