@@ -77,9 +77,9 @@ the device up or brushing it can never change monitor level, switch groups or ap
 
 ## Display
 
-![The dial's screens: active while turning, muted, standby, knob refused, no Home Assistant link, and the group picker](images/dial_states.png)
+<img src="images/dial_states.png" width="640" alt="The dial's screens: active while turning, muted, standby, knob refused, no Home Assistant link, and the scene and group picker">
 
-*The main screen in its most common states, and the group picker. Rendered from the screen layout, not
+*The main screen in its most common states, and the picker. Rendered from the screen layout, not
 photographed.*
 
 The ring is green when the level shown is the level you hear, red when muted, grey when the
