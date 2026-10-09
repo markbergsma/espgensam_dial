@@ -64,14 +64,14 @@ picking the device up or brushing it can never change monitor level or switch gr
 
 ## Display
 
-```
-      ╭───────────────╮        outer ring   volume, 270° sweep
-    ╭─┤    standby    ├─╮      badge        state; red MUTE when muted and otherwise active
-    │ │     -42.5     │ │      large        volume in dB (or percentage)
-    │ │       dB      │ │
-    ╰─┤      58%      ├─╯      small        the other value, only while turning
-      ╰─(Home Cinema)─╯        button       active group preset, if espgensam has groups
-```
+![The dial's screens: active while turning, muted, standby, knob refused, no Home Assistant link, and the group picker](images/dial_states.png)
+
+*The main screen in its most common states, and the group picker. Rendered from the screen layout, not
+photographed.*
+
+The ring is green when the level shown is the level you hear, red when muted, grey when the
+level is held (standby, waking or no monitors), and empty when the dial has no control. It
+flashes amber when a turn is refused.
 
 The knob is refused while Genelec's GLM adapter owns the bus or the Home Assistant link is down,
 and the badge says which. In standby a turn still sets the level, ready for power-on.
