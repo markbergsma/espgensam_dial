@@ -82,6 +82,12 @@ globals:
     type: float
     restore_value: false
     initial_value: "-50.0"
+  # A report arrived inside the grace period and was ignored, so it still has to be judged once
+  # that period ends. That is the only place a refused write shows up.
+  - id: reconcile_pending
+    type: bool
+    restore_value: false
+    initial_value: "false"
   - id: last_detent_ms
     type: uint32_t
     restore_value: false
@@ -275,8 +281,15 @@ script:
   # Reconciliation of reported volume against local state.
   #
   # Three cases have to be told apart: the echo of our own write, a stale value arriving while the
-  # user is still turning, and a genuine external change (HA slider, Genelec's GLM software, or
-  # espgensam snapping back a refused write).
+  # user is still turning, and a genuine external change (HA slider, Genelec's GLM software, an
+  # HDMI CEC bridge).
+  #
+  # A refused write is NOT recognisable here. espgensam publishes the old value back as soon as it
+  # refuses, so that report lands inside the grace period alongside the echoes. The last report
+  # from inside the grace period is therefore judged when the period ends (see the 250 ms
+  # interval), and a divergent report arriving outside it is always someone else's change. Judging
+  # it here against vol_sent once flagged every external change as refused, since vol_sent equals
+  # vol_db at rest.
   # ---------------------------------------------------------------------------------------------
   - id: on_volume_reported
     parameters:
@@ -314,26 +327,22 @@ script:
           const bool user_active = (now - id(last_local_change_ms)) < ${reconcile_grace};
           const bool write_inflight = (now - id(last_write_ms)) < ${reconcile_grace};
           if (user_active || write_inflight) {
-            // Our own echo, or stale. Recorded above so the next genuine report can be judged.
+            // Our own echo, stale, or a refusal. Recorded above and judged when the grace period
+            // ends.
+            id(reconcile_pending) = true;
             return;
           }
+          id(reconcile_pending) = false;  // this report supersedes any still awaiting judgement
 
           const float tol = (id(vol_step) > 0.0f) ? id(vol_step) / 2.0f : 0.25f;
           if (fabsf(reported - id(vol_db)) < tol) {
             return;  // already agreed
           }
 
-          // Diverged after the grace period. If it also differs from what we last sent, the
-          // device rejected our write rather than someone else changing it.
-          const bool rejection =
-              fabsf(reported - id(vol_sent)) >= ((id(vol_step) > 0.0f) ? id(vol_step) : 0.5f);
-          ESP_LOGI("dial", "adopting reported volume %.1f dB (was %.1f, rejection=%d)",
-                   reported, id(vol_db), rejection);
+          ESP_LOGI("dial", "adopting external volume change %.1f dB (was %.1f)", reported,
+                   id(vol_db));
           id(vol_db) = reported;
           id(vol_sent) = reported;
-          if (rejection) {
-            id(refused_until_ms) = now + 700;
-          }
       - script.execute: ui_refresh
 
   # Short press: mute. Optimistic local flip so the screen reacts at once; the transport's
@@ -537,11 +546,28 @@ script:
           brightness: ${idle_brightness}
 
 interval:
-  # Expire the amber "refused" pulse, and hide the secondary readout once secondary_hold has
-  # passed since the last detent.
+  # Judge the last report from inside the grace period once that period ends, expire the amber
+  # "refused" pulse, and hide the secondary readout once secondary_hold has passed since the last
+  # detent.
   - interval: 250ms
     then:
       - lambda: |-
+          // A report ignored during the grace period that still disagrees once the period is over
+          // means espgensam did not apply our write. Snap back to it, visibly.
+          if (id(reconcile_pending) && id(volume_known) &&
+              (millis() - id(last_local_change_ms)) >= ${reconcile_grace} &&
+              (millis() - id(last_write_ms)) >= ${reconcile_grace}) {
+            id(reconcile_pending) = false;
+            const float tol = (id(vol_step) > 0.0f) ? id(vol_step) / 2.0f : 0.25f;
+            if (fabsf(id(vol_reported) - id(vol_db)) >= tol) {
+              ESP_LOGW("dial", "write not applied; reverting to %.1f dB", id(vol_reported));
+              id(vol_db) = id(vol_reported);
+              id(vol_sent) = id(vol_reported);
+              id(refused_until_ms) = millis() + 700;
+              id(ui_refresh)->execute();
+            }
+          }
+
           static bool was_refusing = false;
           const bool refusing = millis() < id(refused_until_ms);
           const bool secondary_expired = id(ui_secondary_shown) &&
