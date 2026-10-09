@@ -207,7 +207,10 @@ sensor:
     unit_of_measurement: dB
     accuracy_decimals: 1
     entity_category: diagnostic
+    disabled_by_default: true
     update_interval: 10s
+    filters:
+      - delta: 0.05
     lambda: "return id(vol_db);"
 
   # Encoder triggers are bound here rather than in the board package, so that swapping the board
