@@ -514,11 +514,15 @@ script:
                   - script.execute: picker_populate
       - script.execute: ui_refresh
 
+  # lvgl's on_idle fires once per idle period, and only LVGL input (touch) ends that period. The
+  # knob and button bypass LVGL, so without the activity reset below, waking the screen from them
+  # left LVGL still idle, the dim never fired again, and the backlight stayed bright for good.
   - id: wake_backlight
     mode: restart
     then:
       - lambda: |-
           id(backlight_dimmed) = false;
+          lv_display_trigger_activity(nullptr);  // the default (only) display
       - light.turn_on:
           id: display_backlight
           brightness: ${active_brightness}
