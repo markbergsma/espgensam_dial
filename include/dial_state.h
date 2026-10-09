@@ -1,8 +1,11 @@
 #pragma once
 
+#include <string>
+#include <vector>
+
 /**
  * @file dial_state.h
- * @brief System state vocabulary shared between the transport, control and UI layers.
+ * @brief System state and picker vocabulary shared between the transport, control and UI layers.
  *
  * ## Why this header exists
  *
@@ -90,23 +93,78 @@ enum DialState : int {
  * @brief What the knob and button currently mean. Unlike DialState this is the dial's own
  *        condition, not the controlled system's, so it is owned by `packages/control.yaml`.
  *
- * The knob means volume except while the group picker is open. The picker is entered only by a
+ * The knob means volume except while the picker is open. The picker is entered only by a
  * deliberate tap and leaves by itself after `picker_timeout`, so a dial left alone always drifts
  * back to being a volume knob. Nothing is applied until a button press confirms, which is why a
  * stray tap can at worst open a picker that then closes unused.
+ *
+ * The picker is one list of two kinds of row: Home Assistant scenes first, then espgensam's group
+ * presets. They confirm differently, on purpose. A scene means "set the room to this", and the
+ * room drifts as soon as anything in it is touched, so confirming the last applied scene applies it
+ * again; that is the remedy for drift. A group is a state espgensam holds and reports, so
+ * confirming the group already in use does nothing; a re-push would only duck the volume.
+ *
+ * Scene rows stay usable while GLM owns the bus, group rows do not. A scene is mostly about things
+ * other than the monitors (and may itself power the system on), whereas a group write is refused
+ * by espgensam outright in that state.
  */
 enum UiMode : int {
   /// Knob: volume. Short press: mute. Long press: power.
   UI_VOLUME = 0,
 
-  /// Knob: move the highlight. Short press: apply the highlighted group. Long press or tap:
-  /// cancel. Power is deliberately unreachable from here.
-  UI_GROUP_PICKER = 1,
+  /// Knob: move the highlight. Short press: apply the highlighted scene or group. Long press or
+  /// tap: cancel. Power is deliberately unreachable from here.
+  UI_PICKER = 1,
 };
+
+/**
+ * @brief Identity of picker row @p i: `"s:<scene key>"` or `"g:<group name>"`.
+ *
+ * Rows are the scenes in `scene_keys` order, then the groups in `group_names` order. The picker
+ * remembers its highlight by this key rather than by index, because the scene list is re-queried
+ * while the picker is open, and a scene added or removed above the highlight would otherwise
+ * silently move it onto a different item.
+ *
+ * @param scene_keys  the transport's opaque scene keys
+ * @param group_names the transport's group names
+ * @param i           row index
+ * @return the row's key, or `""` when @p i is out of range
+ */
+inline std::string picker_row_key(const std::vector<std::string> &scene_keys,
+                                  const std::vector<std::string> &group_names, int i) {
+  const int scenes = (int) scene_keys.size();
+  if (i < 0) {
+    return "";
+  }
+  if (i < scenes) {
+    return "s:" + scene_keys[i];
+  }
+  if (i - scenes < (int) group_names.size()) {
+    return "g:" + group_names[i - scenes];
+  }
+  return "";
+}
+
+/**
+ * @brief Row index holding @p key, the inverse of picker_row_key().
+ * @return the index, or -1 when no row has that key (or @p key is empty)
+ */
+inline int picker_find_row(const std::vector<std::string> &scene_keys,
+                           const std::vector<std::string> &group_names, const std::string &key) {
+  const int rows = (int) (scene_keys.size() + group_names.size());
+  for (int i = 0; !key.empty() && i < rows; i++) {
+    if (picker_row_key(scene_keys, group_names, i) == key) {
+      return i;
+    }
+  }
+  return -1;
+}
 
 }  // namespace espgensam_dial
 
 using espgensam_dial::DialState;
+using espgensam_dial::picker_find_row;
+using espgensam_dial::picker_row_key;
 using espgensam_dial::STATE_ACTIVE;
 using espgensam_dial::STATE_DISCONNECTED;
 using espgensam_dial::STATE_GLM_LOCKED;
@@ -114,5 +172,5 @@ using espgensam_dial::STATE_OFFLINE;
 using espgensam_dial::STATE_STANDBY;
 using espgensam_dial::STATE_WAKING;
 using espgensam_dial::UiMode;
-using espgensam_dial::UI_GROUP_PICKER;
+using espgensam_dial::UI_PICKER;
 using espgensam_dial::UI_VOLUME;

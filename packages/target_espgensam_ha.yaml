@@ -2,16 +2,18 @@
 #
 # This package is the only file that knows Home Assistant exists or names an entity. It is the
 # seam for the planned UDP-direct transport: a target_espgensam_udp.yaml implementing the same
-# three scripts and writing the same globals drops in here with no change to control.yaml or
-# ui_volume.yaml.
+# same scripts and writing the same globals drops in here with no change to control.yaml or the
+# ui_*.yaml packages.
 #
 # The contract it implements (see AGENTS.md):
 #   provides scripts   target_set_volume(db), target_toggle_mute(), target_set_power(on),
-#                      target_set_group(name)
+#                      target_set_group(name), target_refresh_scenes(),
+#                      target_activate_scene(scene)
 #   writes globals     vol_db, vol_min, vol_max, vol_step, bounds_known, is_muted, sys_power_off,
-#                      group_names, group_active, group_pending_until_ms
+#                      group_names, group_active, group_pending_until_ms,
+#                      scene_names, scene_keys, scene_last
 #   defines            derive_state
-#   invokes            on_volume_reported(reported), on_groups_changed
+#   invokes            on_volume_reported(reported), on_groups_changed, on_scenes_changed
 #
 # Group presets and volume ducking (no action needed — documented so it is not "fixed" later):
 # when espgensam has groups configured it pushes one at every wake and rediscovery, ducking the
@@ -34,6 +36,29 @@
 # silently ignores a name it does not know, so the dial treats the state as confirmation of the
 # request and nothing more. A group changed from GLM itself is not seen by espgensam, so it is
 # not seen here either.
+#
+# Scenes are Home Assistant's, not espgensam's, and are found by label rather than by entity id —
+# see target_refresh_scenes for how. A scene key is its entity id; control.yaml treats it as
+# opaque.
+
+api:
+  # The other half of the scene query; see target_refresh_scenes. Home Assistant registers this as
+  # esphome.<node name>_scene_query. It does nothing and answers with an empty object, which is
+  # all target_refresh_scenes needs from it. Nothing else should call it.
+  actions:
+    - action: scene_query
+      then:
+        - api.respond:
+            data: !lambda "(void) root;"
+
+  # Home Assistant registers the action above, and starts accepting this device's action calls,
+  # only once the connection is up, so the first query waits a moment. Any client connecting
+  # (such as `esphome logs`) also lands here, which costs one extra query.
+  on_client_connected:
+    - lambda: |-
+        id(scene_query_stalled) = false;
+        id(scene_query_sent_ms) = 0;
+    - script.execute: scene_refresh_soon
 
 number:
   # READ-ONLY bridge to espgensam's "Volume (dB)". Writes go through target_set_volume, which
@@ -208,8 +233,15 @@ interval:
           }
           // Not a warning: groups are optional in espgensam, and its committed config has none.
           if (id(ha_group)->state.empty()) {
-            ESP_LOGI("dial", "no state from '%s' - no group picker (check the id if espgensam "
-                     "has groups)", "${ent_group}");
+            ESP_LOGI("dial", "no state from '%s' - no group rows in the picker (check the id if "
+                     "espgensam has groups)", "${ent_group}");
+          }
+          // Also not a warning, for the same reason. A label carried by no scene is a valid
+          // answer and does arrive; this means no answer came at all.
+          if (!std::string_view("${scene_label}").empty() && !id(scenes_known)) {
+            ESP_LOGI("dial", "no scene list from Home Assistant - no scene rows (needs action "
+                     "responses: a recent Home Assistant, and this device allowed to perform "
+                     "actions)");
           }
 
   # Expire an unconfirmed optimistic mute, snapping the screen back to what Home Assistant
@@ -247,6 +279,10 @@ interval:
             id(refused_until_ms) = millis() + 700;
             id(ui_refresh)->execute();
           }
+
+  - interval: ${scene_refresh}
+    then:
+      - script.execute: target_refresh_scenes
 
 script:
   - id: target_set_volume
@@ -335,6 +371,156 @@ script:
           ESP_LOGI("dial", "write: group -> '%s'", name.c_str());
           id(group_active) = name;
           id(group_pending_until_ms) = millis() + ${reconcile_grace};
+
+  # Asks Home Assistant for the scenes carrying ${scene_label}.
+  #
+  # An ESPHome device cannot enumerate Home Assistant entities: every homeassistant-platform
+  # sensor names one entity at compile time. But an action call can capture a response, and Home
+  # Assistant renders the call's response_template with its full template environment, which can.
+  # The template needs an action to hang off that returns a response, Home Assistant has no
+  # always-present side-effect-free one, so the dial calls its own scene_query action (above)
+  # through Home Assistant. Home Assistant calls back into the dial, gets `{}`, renders the
+  # template, and hands the result to on_success, wrapped as {"response": <result>} like every
+  # action response it sends an ESPHome device. Nothing blocks meanwhile: homeassistant.action
+  # returns as soon as the call is sent.
+  #
+  # The template returns name-sorted parallel lists, so a "1 " prefix orders the picker, plus the
+  # scene with the newest activation timestamp (a scene entity's state). That is only when it was
+  # last applied, not whether the room still matches it.
+  #
+  # One query at a time, because ESPHome keeps a call's response callback until a response
+  # arrives and has no timeout: a call Home Assistant never answers — it drops them silently when
+  # the device may not perform actions — would otherwise leak one per refresh. A query unanswered
+  # after 10 s stops further ones until the API reconnects. A refresh asked for while one is in
+  # flight is run once that one is answered, because the answer may predate whatever prompted it
+  # (a scene just applied).
+  - id: target_refresh_scenes
+    then:
+      - lambda: |-
+          const bool linked = (api::global_api_server != nullptr) &&
+                              api::global_api_server->is_connected();
+          if (std::string_view("${scene_label}").empty() || id(scene_query_stalled) || !linked) {
+            return;
+          }
+          if (id(scene_query_sent_ms) != 0) {
+            if (millis() - id(scene_query_sent_ms) < 10000) {
+              id(scene_query_again) = true;
+              return;
+            }
+            ESP_LOGW("dial", "no reply to the scene query; not asking again until reconnected "
+                     "(is this device allowed to perform Home Assistant actions?)");
+            id(scene_query_stalled) = true;
+            id(scene_query_sent_ms) = 0;
+            return;
+          }
+          id(scene_query_sent_ms) = std::max<uint32_t>(millis(), 1);
+          id(scene_query_again) = false;
+          id(scene_query_send)->execute();
+
+  - id: scene_query_send
+    then:
+      - homeassistant.action:
+          # HA's name for the action above: esphome.<node name with '-' as '_'>_scene_query.
+          action: !lambda |-
+            std::string node = App.get_name();
+            std::replace(node.begin(), node.end(), '-', '_');
+            return "esphome." + node + "_scene_query";
+          capture_response: true
+          response_template: |-
+            {% set ns = namespace(s=[]) %}
+            {% for e in label_entities('${scene_label}') | select('match', 'scene[.]') %}
+              {% set ns.s = ns.s + [{'n': state_attr(e, 'friendly_name') or e, 'e': e,
+                                     't': states(e)}] %}
+            {% endfor %}
+            {% set by_name = ns.s | sort(attribute='n') %}
+            {% set seen = ns.s | rejectattr('t', 'in', ['unknown', 'unavailable'])
+                               | sort(attribute='t') | list %}
+            {{ {'scenes': by_name | map(attribute='n') | list,
+                'entity_ids': by_name | map(attribute='e') | list,
+                'last': (seen | last).e if seen else ''} }}
+          on_success:
+            - lambda: |-
+                id(scene_query_sent_ms) = 0;
+                // All-or-nothing, like the group list: a partial list would put the wrong key
+                // under a name.
+                JsonObjectConst result = response["response"].as<JsonObjectConst>();
+                JsonArrayConst names = result["scenes"].as<JsonArrayConst>();
+                JsonArrayConst keys = result["entity_ids"].as<JsonArrayConst>();
+                JsonVariantConst last = result["last"];
+                bool ok = !names.isNull() && !keys.isNull() && names.size() == keys.size() &&
+                          last.is<const char *>();
+                std::vector<std::string> n, k;
+                for (size_t i = 0; ok && i < names.size(); i++) {
+                  const char *name = names[i].as<const char *>();
+                  const char *key = keys[i].as<const char *>();
+                  ok = name != nullptr && key != nullptr && *key != '\0';
+                  if (ok) {
+                    n.emplace_back(name);
+                    k.emplace_back(key);
+                  }
+                }
+                if (!ok) {
+                  std::string got;
+                  serializeJson(response, got);
+                  ESP_LOGW("dial", "unexpected scene query response, keeping the previous list: %s",
+                           got.c_str());
+                } else {
+                  if (!id(scenes_known) || n != id(scene_names) || k != id(scene_keys)) {
+                    ESP_LOGI("dial", "%u scenes from HA", (unsigned) n.size());
+                    id(scene_names) = std::move(n);
+                    id(scene_keys) = std::move(k);
+                  }
+                  id(scene_last) = last.as<const char *>();
+                  id(scenes_known) = true;
+                  id(on_scenes_changed)->execute();
+                }
+                if (id(scene_query_again)) {
+                  id(target_refresh_scenes)->execute();
+                }
+          on_error:
+            - lambda: |-
+                id(scene_query_sent_ms) = 0;
+                // Usually the action not being registered yet just after connecting; the next
+                // refresh retries. Anything persistent would repeat every scene_refresh.
+                static bool logged = false;
+                if (!logged) {
+                  ESP_LOGI("dial", "scene query failed: %s", error.c_str());
+                  logged = true;
+                } else {
+                  ESP_LOGD("dial", "scene query failed: %s", error.c_str());
+                }
+                if (id(scene_query_again)) {
+                  id(target_refresh_scenes)->execute();
+                }
+
+  - id: scene_refresh_soon
+    mode: restart
+    then:
+      - delay: 5s
+      - script.execute: target_refresh_scenes
+
+  # Fire and forget as far as the room goes: Home Assistant reports a scene as applied, not what the
+  # room then looks like. scene_last is set at once so the button and hint follow the press; the
+  # refresh on success confirms it from Home Assistant's own record, and a failure reverts it.
+  - id: target_activate_scene
+    parameters:
+      scene: string
+    then:
+      - lambda: |-
+          ESP_LOGI("dial", "write: scene -> '%s'", scene.c_str());
+          id(scene_last) = scene;
+      - homeassistant.action:
+          action: scene.turn_on
+          data:
+            entity_id: !lambda "return scene;"
+          on_success:
+            - script.execute: target_refresh_scenes
+          on_error:
+            - lambda: |-
+                ESP_LOGW("dial", "scene '%s' not applied: %s", scene.c_str(), error.c_str());
+                id(refused_until_ms) = millis() + 700;
+            - script.execute: target_refresh_scenes
+            - script.execute: ui_refresh
 
   # Promote the three attributes to a usable scale once all of them have arrived and agree.
   - id: bounds_check

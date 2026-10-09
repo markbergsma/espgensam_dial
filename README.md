@@ -29,8 +29,9 @@ fits the thing you do most often at a desk: reach out and turn a knob.
   badge says why not: GLM bus lockout, standby, wake-up progress or loss of the Home Assistant link.
 - **Runtime bounds discovery** — volume min/max/step are read from Home Assistant, so nothing is
   hardcoded and espgensam's configuration can change freely.
-- **Group presets** — switch between the GLM groups espgensam has configured, picked from a
-  list on the screen and confirmed with the button.
+- **Scenes and group presets** — apply a Home Assistant scene, or switch between the GLM groups
+  espgensam has configured, picked from one list on the screen and confirmed with the button.
+  Which scenes appear is chosen with a label in Home Assistant, with no reflash.
 
 ---
 
@@ -42,23 +43,35 @@ fits the thing you do most often at a desk: reach out and turn a knob.
 | Front button | short press | mute / unmute |
 | Front button | long press (≥ 800 ms) | monitors on / off |
 | Screen | tap | wake the backlight only — never changes audio |
-| Group button (bottom of the screen) | tap | open the group picker; if the screen is dimmed, only wake it |
+| Picker button (bottom of the screen) | tap | open the picker; if the screen is dimmed, only wake it |
 
-In the group picker:
+The picker lists your scenes first, then the group presets. The title above the list says which
+kind the highlighted row is.
 
 | Input | Gesture | Action |
 |---|---|---|
-| Knob | turn | move through the groups |
-| Front button | short press | apply the highlighted group |
+| Knob | turn | move through the list |
+| Front button | short press | apply the highlighted scene or group |
 | Front button | long press | cancel |
 | Screen | tap | cancel |
 
-The picker closes on its own after 8 s without input. The picker opens on the group in use.
-Confirming that group again changes nothing.
+The picker closes on its own after 8 s without input. It opens on the scene applied last, or
+else on the group in use.
 
-Only the group button opens the picker; a tap anywhere else just wakes the screen. A tap never
-changes audio by itself. The picker applies nothing until you press the button, so
-picking the device up or brushing it can never change monitor level or switch groups.
+Scenes and groups differ on a second press. Confirming the group already in use changes nothing.
+Confirming a scene always applies it, even the one applied last, so pressing it again puts the
+room back the way that scene sets it.
+
+While Genelec's GLM software owns the bus, scenes can still be applied but groups cannot.
+
+The picker button shows the scene applied last, or the group in use if no scene has been applied.
+Set `picker_button_shows: "group"` in `espgensam_dial.yaml` to show the group instead; the picker
+offers both either way. A scene applied from elsewhere (Home Assistant itself, an automation) shows up the next time the
+dial asks for the scene list: when the picker opens, or at the periodic refresh (`scene_refresh`).
+
+The button is the only thing that opens the picker; a tap anywhere else just wakes the screen. A
+tap never changes audio by itself. The picker applies nothing until you press the button, so picking
+the device up or brushing it can never change monitor level, switch groups or apply a scene.
 
 ---
 
@@ -105,14 +118,14 @@ packages/
   target_espgensam_ha.yaml     TRANSPORT — the only file that knows Home Assistant exists
   control.yaml                 input, optimistic state, writes, reconciliation
   ui_volume.yaml               LVGL fonts, volume page, repaint
-  ui_group.yaml                LVGL group preset picker
+  ui_picker.yaml               LVGL picker for scenes and group presets
 include/dial_state.h           the DialState and UiMode vocabulary and their rules
 ```
 
 Two seams: `control.yaml` and the `ui_*.yaml` packages never name a Home Assistant
-entity; they reach the controlled system only through four scripts (`target_set_volume`,
-`target_toggle_mute`, `target_set_power`, `target_set_group`) and read its condition only from
-globals the transport package writes. See
+entity; they reach the controlled system only through the transport's `target_*` scripts
+(`target_set_volume`, `target_set_group`, `target_activate_scene` and so on) and read its condition
+only from globals the transport package writes. See
 [AGENTS.md](AGENTS.md) for the full contract.
 
 That is what makes a planned UDP-direct transport a one-file change, and a different dial
@@ -164,7 +177,22 @@ wrong one makes that value read `unknown` forever, with no error.
 groups (`groups:` or `sam_file:`) and declares `group_select: name: "Group Preset"`. Without it
 the dial works as before, and a tap only wakes the screen.
 
-### 3. Build and flash
+### 3. Choose the scenes
+
+In Home Assistant, give the label **`dial`** to each scene the dial should offer (Settings → Areas,
+labels & zones → Labels, or a scene's settings). The dial asks Home Assistant for the scenes
+carrying that label when it connects, every time the picker opens, and every 60 minutes. So
+labelling or unlabelling a scene changes the list without a reflash.
+
+Scenes are listed alphabetically by name, so you can order them with a prefix such as
+"1 Movie night", "2 Mixing". A different label name goes in `scene_label` in
+`espgensam_dial.yaml`. Leaving it empty turns scenes off.
+
+This needs a Home Assistant recent enough to send action responses to ESPHome devices, and the
+permission in step 5. To preview what the dial will receive, paste the `response_template` from
+`target_refresh_scenes` in `packages/target_espgensam_ha.yaml` into **Developer Tools → Template**.
+
+### 4. Build and flash
 
 ```bash
 esphome compile espgensam_dial-local.yaml    # or espgensam_dial.yaml if you edited it directly
@@ -172,14 +200,15 @@ esphome compile espgensam_dial-local.yaml    # or espgensam_dial.yaml if you edi
 
 then flash the resulting firmware.
 
-### 4. Allow the dial to perform Home Assistant actions
+### 5. Allow the dial to perform Home Assistant actions
 
 **Required, and easy to miss.** In Home Assistant: Settings → Devices & Services → ESPHome →
 the dial's entry → **Configure** → enable **"Allow the device to perform Home Assistant
 actions"**.
 
-Reading state needs no permission, but *every* write — volume, mute, power and group alike — goes through
-a Home Assistant action and is gated by this single option. With it off the dial looks like it is
+Reading state needs no permission, but *every* write — volume, mute, power, group and scene
+alike — goes through a Home Assistant action and is gated by this single option, as does fetching
+the scene list. With it off the dial looks like it is
 working: the screen tracks the knob perfectly and reads espgensam's state correctly, but nothing
 ever reaches the monitors.
 
@@ -209,8 +238,8 @@ the device log shows plainly whether a write was attempted and whether it left t
   system to an arbitrary level.
 - **If an entity id is wrong, nothing errors.** Home Assistant simply sends no state, so the value
   sits empty forever. About 30 s after boot the dial logs a warning naming any of the three
-  required entities that never reported, and an info line if the group select did not — worth
-  checking for on a first flash.
+  required entities that never reported, and an info line if the group select or the scene list
+  did not — worth checking for on a first flash.
 - **The dial depends on Home Assistant.** espgensam itself is autonomous, but an HA-mediated remote
   is not; the empty ring and "no link" badge make that visible rather than pretending. A UDP transport
   straight to espgensam is the planned fix.

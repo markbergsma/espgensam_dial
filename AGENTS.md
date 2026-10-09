@@ -24,7 +24,7 @@ packages/board_m5stack_dial.yaml    seam 1: hardware
 packages/target_espgensam_ha.yaml   seam 2: transport
 packages/control.yaml               ── behaviour, transport-agnostic
 packages/ui_volume.yaml             ── presentation, transport-agnostic
-packages/ui_group.yaml              ── presentation, transport-agnostic
+packages/ui_picker.yaml             ── presentation, transport-agnostic
 ```
 
 ### Rules
@@ -47,9 +47,11 @@ A transport package must provide:
 | `target_toggle_mute()` | invert the current mute state |
 | `target_set_power(power_on: bool)` | power the monitors on or off |
 | `target_set_group(name: string)` | apply the named group preset, optimistically |
+| `target_refresh_scenes()` | ask for the scene list again; the answer arrives later, if at all |
+| `target_activate_scene(scene: string)` | apply the scene with that key; always applies, even the last one |
 
-It must **define** `derive_state`, and **invoke** it and control's `on_volume_reported(reported)`
-and `on_groups_changed` as incoming state arrives. It owns these globals:
+It must **define** `derive_state`, and **invoke** it and control's `on_volume_reported(reported)`,
+`on_groups_changed` and `on_scenes_changed` as incoming state arrives. It owns these globals:
 
 | Global | Meaning |
 |---|---|
@@ -64,6 +66,13 @@ and `on_groups_changed` as incoming state arrives. It owns these globals:
 | `group_names` | group preset names in the controlled system's order; empty = no picker |
 | `group_active` | current group name; `""` when unknown |
 | `group_pending_until_ms` | optimistic group choice awaiting confirmation |
+| `scene_names` | scene display names in picker order; empty = no scene rows |
+| `scene_keys` | parallel to `scene_names`: opaque keys control hands back to `target_activate_scene` |
+| `scene_last` | key of the last applied scene; `""` when unknown |
+
+A scene key is whatever the transport needs to apply that scene (in the HA transport, its entity
+id). Control and UI compare and pass keys but never interpret them, which is what keeps them free
+of Home Assistant names.
 
 `sys_state` and `sys_power_off` answer different questions and must not be conflated. `sys_state`
 is for display and for deciding whether input is accepted; power intent comes from
@@ -137,8 +146,24 @@ to work on the bench and misbehaves in use.
    revert, as for mute), and does not notice a group changed from GLM. Its `options` attribute
    reaches the dial as a Python list repr, which ArduinoJson (ESPHome's `json:`) happens to
    accept; see `ha_group_options` in the transport. The roller that
-   shows them is loaded through raw `lv_roller_set_options()`; `packages/ui_group.yaml` says why
+   shows them is loaded through raw `lv_roller_set_options()`; `packages/ui_picker.yaml` says why
    ESPHome's own options API must not be used there.
+9. **Scenes are Home Assistant's, found by label, through the dial's own action.** An ESPHome
+   device can only subscribe to entities named at compile time, so the scene list comes from a
+   `response_template` that Home Assistant renders (`label_entities()`) on a call the dial makes to
+   its *own* `scene_query` API action. That action is there only because Home Assistant renders a
+   response template only for an action that returns a response, and has no always-present,
+   side-effect-free one. Consequences:
+   - Scenes need action-response support in both ESPHome and Home Assistant, plus the "perform
+     Home Assistant actions" permission. Without them there are simply no scene rows.
+   - ESPHome keeps an unanswered call's response callback forever, and Home Assistant answers
+     nothing when it refuses a call. So `target_refresh_scenes` allows one query in flight and
+     stops after one goes unanswered. Do not "simplify" that into a plain refresh.
+   - `scene_last` is when Home Assistant last activated a scene, not whether the room still
+     matches it. That is why a scene re-applies on confirm while a group does not
+     (`include/dial_state.h`).
+   - Scene rows stay available while GLM owns the bus. Whatever a scene asks of espgensam is then
+     refused by espgensam, but the rest of the scene still applies.
 
 ---
 

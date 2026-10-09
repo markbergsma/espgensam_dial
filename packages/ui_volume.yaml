@@ -48,9 +48,9 @@ font:
     id: font_small
     size: 16
     bpp: 4
-    # Carries the "dB" unit, every status badge word, "MUTE" and the group name. Group names come
-    # from the user's GLM setup at runtime, so this is a whole Latin glyph set rather than a
-    # subset of known words.
+    # Carries the "dB" unit, every status badge word, "MUTE" and the picker button's group or
+    # scene name. Those names come from the user's GLM and Home Assistant setup at runtime, so this
+    # is a whole Latin glyph set rather than a subset of known words.
     glyphsets: [GF_Latin_Core]
 
 # The background silhouette. An alpha mask, which LVGL stores as A8 and paints in the widget's
@@ -100,7 +100,8 @@ lvgl:
         # above black, so the silhouette all but disappears when the backlight dims.
         #
         # The cabinet spans y -76..+64, inside the ring's ~97 px inner radius and clear of the
-        # group button below. The woofer sits behind the large number, the tweeter behind the badge.
+        # picker button below. The woofer sits behind the large number, the tweeter behind the
+        # badge.
         - image:
             id: spk_silhouette
             src: monitor_silhouette
@@ -189,19 +190,20 @@ lvgl:
             on_short_click:
               - script.execute: wake_backlight
 
-        # The active group preset, drawn as a button in the ring's bottom gap. Only this opens
-        # the picker: a tap on the readout above is far more likely to be a hand picking the
-        # dial up than a request for a menu. It must come after touch_overlay, so that it sits
-        # on top and receives its own touches. It is hidden when espgensam has no groups, and
-        # its touches then fall through to the overlay.
+        # The picker button in the ring's bottom gap, labelled with the last applied scene or the
+        # active group preset, per picker_button_shows. Only this opens the picker: a tap on the
+        # readout above is far more likely to be a hand picking the dial up than a request for a
+        # menu. It must come after touch_overlay, so that it sits on top and receives its own
+        # touches. It is hidden when there are neither scenes nor groups, and its touches then
+        # fall through to the overlay.
         #
-        # Two lines of font_small tall, so a longer GLM group name wraps instead of being cut
+        # Two lines of font_small tall, so a longer name wraps instead of being cut
         # short. The panel's circle narrows to ~120 px across at this height, which caps the
         # width, and the bottom edge is as low as the corners can go and stay on the glass, so
         # any extra height has to come from above. That is why MUTE lives in the status badge. ext_click_area makes the target bigger than
         # the pill without drawing it bigger. The position and size want checking on the bench.
         - button:
-            id: group_button
+            id: picker_button
             align: CENTER
             y: 89
             width: 112
@@ -212,7 +214,7 @@ lvgl:
             bg_color: 0x1A1A1A
             bg_opa: COVER
             border_width: 1
-            border_color: 0x3A3A3A
+            border_color: 0x007A54 # set per kind by ui_refresh
             shadow_width: 0
             pad_all: 0
             pressed:
@@ -224,7 +226,7 @@ lvgl:
               # Sized to its text up to two lines, so a one-line name sits centred; beyond two,
               # LVGL ends the second line with dots. 38 = 2 x font_small's 19 px line height.
               - label:
-                  id: group_label
+                  id: picker_label
                   align: CENTER
                   width: 100
                   max_height: 38
@@ -361,19 +363,64 @@ script:
             return mute_shown ? lv_color_hex(0xDC2626) : lv_color_hex(0xF59E0B);
 
       - lvgl.widget.update:
-          id: group_button
-          hidden: !lambda "return id(group_names).empty();"
+          id: picker_button
+          hidden: !lambda "return id(scene_keys).empty() && id(group_names).empty();"
 
-      # With groups but no active one yet (espgensam in listen-only mode, or started with
-      # `default_group: none`), the button still has to read as something to press.
+      # picker_button_shows picks which the button names: the last applied scene, or the active
+      # group. Each has a blind spot. The last applied scene is only what Home Assistant last
+      # activated, so a group changed since does not displace it. The group, on the other hand,
+      # hides the scene that set it. Whichever is chosen, the other stands in while the chosen one
+      # is unknown. With neither (no scene applied yet, espgensam in listen-only mode or started
+      # with `default_group: none`) the button still has to read as something to press.
+      #
+      # The border says which kind the label is, because the stand-in makes that vary at runtime
+      # and the names alone do not tell a scene from a group. The colours are the picker's in-use
+      # colours (see ui_picker.yaml), dimmed for a 1 px line: blue for a scene, and for a group
+      # the exact green GLM 5 uses for its active group button. Dimmed and bluer, it stays clear of
+      # the ring's live green (see the ring palette in the file comment).
+      - lambda: |-
+          constexpr std::string_view kShows = "${picker_button_shows}";
+          static_assert(kShows == "scene" || kShows == "group",
+                        "picker_button_shows must be \"scene\" or \"group\"");
+          constexpr bool kScene = kShows == "scene";
+          const auto &sk = id(scene_keys);
+          std::string scene;
+          for (size_t i = 0; i < sk.size() && i < id(scene_names).size(); i++) {
+            if (sk[i] == id(scene_last)) {
+              scene = id(scene_names)[i];
+              break;
+            }
+          }
+          const std::string &group = id(group_active);
+          const std::string &first = kScene ? scene : group;
+          const std::string &second = kScene ? group : scene;
+          if (!first.empty()) {
+            id(ui_picker_text) = first;
+            id(ui_picker_scene) = kScene;
+          } else if (!second.empty()) {
+            id(ui_picker_text) = second;
+            id(ui_picker_scene) = !kScene;
+          } else {
+            // Name the kind the button prefers, if there are any rows of that kind.
+            const bool has_scenes = !sk.empty();
+            const bool has_groups = !id(group_names).empty();
+            id(ui_picker_scene) = kScene ? has_scenes : !has_groups;
+            id(ui_picker_text) = id(ui_picker_scene) ? "Scene" : "Group";
+          }
+
       - lvgl.label.update:
-          id: group_label
-          text: !lambda |-
-            return id(group_active).empty() ? std::string("Group") : id(group_active);
+          id: picker_label
+          text: !lambda "return id(ui_picker_text);"
 
-      # The picker shows which row is the active group, and that can change underneath it.
+      - lvgl.widget.update:
+          id: picker_button
+          border_color: !lambda |-
+            return id(ui_picker_scene) ? lv_color_hex(0x3B5A8C) : lv_color_hex(0x007A54);
+
+      # The picker shows which rows are in use, and that can change underneath it. Populate, not
+      # just repaint, because the in-use colours are part of the roller's option text.
       - if:
           condition:
-            lambda: "return id(ui_mode) == UI_GROUP_PICKER;"
+            lambda: "return id(ui_mode) == UI_PICKER;"
           then:
-            - script.execute: picker_repaint
+            - script.execute: picker_populate

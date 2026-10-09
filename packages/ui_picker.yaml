@@ -1,0 +1,215 @@
+# UI: the picker — Home Assistant scenes, then espgensam group presets, in one list.
+#
+# Like ui_volume.yaml, this package must never name a Home Assistant entity. It renders
+# scene_names, scene_last, group_names, group_active and picker_index; control.yaml decides when it
+# is shown. The row layout is picker_row_key()'s, in include/dial_state.h.
+#
+# A roller rather than a list or a dropdown: on a round panel only a few rows centred on the
+# middle are fully visible anyway, and a roller keeps the highlighted row in the one place that
+# is never clipped by the bezel. It is driven by the knob alone. It is not clickable, and a
+# transparent button covers the whole page, so a touch can neither scroll it nor pick a row. A tap
+# cancels, and only a button press applies.
+#
+# The two kinds of row share one roller with no divider. The title says which kind the highlighted
+# row is, so it changes from "Scene" to "Group" as the highlight crosses over, and that is the
+# boundary.
+#
+# The rows in use are drawn in their kind's colour, and the hint under the roller takes the same
+# colour when it names one: blue (0x60A5FA) for the last applied scene, and Genelec green for the
+# current group. GLM 5 draws its active group button in 0x007A54 (measured from the GLM 5.2.0
+# manual's screenshots); that is too dark to read as text on black, so the rows use the same hue
+# (~160 degrees) at the blue's brightness, 0x00C080. The picker button's border uses the darker
+# versions. Both hues stay clear of the volume ring's live green (0x22C55E, ~142 degrees), which
+# never appears on this page; red, grey and amber belong to the ring too.
+
+font:
+  - file: "gfonts://Rubik@500"
+    id: font_picker
+    size: 22
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+lvgl:
+  pages:
+    - id: page_picker
+      bg_color: 0x000000
+      pad_all: 0
+      widgets:
+        - label:
+            id: picker_title
+            align: CENTER
+            y: -72
+            text: ""
+            text_font: font_small
+            text_color: 0x8A8A8A
+
+        # 200 px is the panel's width at the outer rows' height (±~40 px). Longer names are
+        # clipped; GLM group names are short in practice, and scene names are the user's to keep
+        # short.
+        - roller:
+            id: picker_roller
+            align: CENTER
+            width: 200
+            visible_row_count: 3
+            mode: NORMAL
+            # Placeholder only. The real options are set at runtime by picker_populate; see the
+            # comment there for why this is not `lvgl.roller.update: options:`.
+            options: ["-"]
+            clickable: false
+            text_font: font_picker
+            text_color: 0x6A6A6A
+            text_align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            selected:
+              text_color: 0xFFFFFF
+              bg_color: 0x1A1A1A
+              bg_opa: COVER
+
+        - label:
+            id: picker_hint
+            align: CENTER
+            y: 72
+            text: ""
+            text_font: font_small
+            text_color: 0x8A8A8A
+
+        # On top of everything else, so it takes every touch on this page.
+        - button:
+            id: picker_touch_overlay
+            align: CENTER
+            width: 240
+            height: 240
+            bg_opa: 0%
+            border_width: 0
+            shadow_width: 0
+            on_short_click:
+              - script.execute: picker_close
+
+script:
+  - id: picker_show
+    then:
+      - script.execute: picker_populate
+      - lvgl.page.show: page_picker
+
+  - id: picker_hide
+    then:
+      - lvgl.page.show: page_volume
+
+  # Loads scene_names then group_names into the roller and puts the highlight on picker_index
+  # without animating. Also run whenever the scene or group in use changes while the picker is
+  # open, since the in-use colours are part of the option text; the LVGL call is skipped when the
+  # text has not changed, so this costs nothing otherwise.
+  #
+  # A roller has no per-row style, so the colours use LVGL's inline recolor syntax,
+  # "#RRGGBB text#", enabled on the roller's internal label (its only child). Both the normal rows
+  # and the highlighted one are drawn with that flag (lv_roller.c), so an in-use row keeps its
+  # colour under the highlight too.
+  #
+  # Deliberately raw LVGL rather than `lvgl.roller.update: options:`. ESPHome's
+  # LvSelectable::set_options() keeps the `const char *` pointers it is given, and it does not
+  # copy the strings they point at. Pointers into the name vectors would dangle as soon as the
+  # transport replaced one. lv_roller_set_options() copies the joined string into LVGL's own
+  # memory. The price is that the widget's ESPHome-side option list stays the static placeholder
+  # above, so nothing may read it back (get_selected_text() and friends); the selection is tracked
+  # in picker_index instead.
+  - id: picker_populate
+    then:
+      - lambda: |-
+          // Appends one row, coloured when color is non-null.
+          auto append = [](std::string &out, const std::string &name, const char *color) {
+            if (!out.empty()) {
+              out += '\n';
+            }
+            if (color != nullptr) {
+              out += '#';
+              out += color;
+              out += ' ';
+            }
+            for (char c : name) {
+              if (c == '\n') {
+                // A newline inside a name would split it into two rows and shift every index
+                // after it.
+                out += ' ';
+              } else if (c == '#') {
+                // "##" is a literal '#', but only outside a coloured run: inside one, a '#' ends
+                // it. So close the run, write the '#', and reopen it.
+                if (color != nullptr) {
+                  out += "####";
+                  out += color;
+                  out += ' ';
+                } else {
+                  out += "##";
+                }
+              } else {
+                out += c;
+              }
+            }
+            if (color != nullptr) {
+              out += '#';
+            }
+          };
+
+          const auto &sk = id(scene_keys);
+          const auto &sn = id(scene_names);
+          std::string opts;
+          for (size_t i = 0; i < sn.size(); i++) {
+            const bool last = i < sk.size() && sk[i] == id(scene_last);
+            append(opts, sn[i], last ? "60A5FA" : nullptr);
+          }
+          for (const auto &name : id(group_names)) {
+            append(opts, name, name == id(group_active) ? "00C080" : nullptr);
+          }
+
+          lv_obj_t *roller = id(picker_roller)->obj;
+          static std::string shown;
+          if (opts != shown) {
+            lv_label_set_recolor(lv_obj_get_child(roller, 0), true);
+            lv_roller_set_options(roller, opts.c_str(), LV_ROLLER_MODE_NORMAL);
+            shown = opts;
+          }
+          lv_roller_set_selected(roller, id(picker_index), LV_ANIM_OFF);
+      - script.execute: picker_repaint
+
+  - id: picker_repaint
+    then:
+      - lvgl.roller.update:
+          id: picker_roller
+          selected_index: !lambda "return id(picker_index);"
+          animated: true
+      - lvgl.label.update:
+          id: picker_title
+          text: !lambda |-
+            return std::string(id(picker_index) < (int) id(scene_keys).size() ? "Scene" : "Group");
+      - lvgl.label.update:
+          id: picker_hint
+          text: !lambda |-
+            const auto &sk = id(scene_keys);
+            const auto &gn = id(group_names);
+            const int i = id(picker_index);
+            const int scenes = (int) sk.size();
+            if (i >= 0 && i < scenes) {
+              // A scene is applied again on confirm even when it was the last one applied, so
+              // this says what it was, not that pressing would do nothing.
+              return std::string(sk[i] == id(scene_last) ? "last applied" : "press to apply");
+            }
+            if (id(sys_state) == STATE_GLM_LOCKED) {
+              return std::string("GLM in control");
+            }
+            const bool current =
+                i >= scenes && i - scenes < (int) gn.size() && gn[i - scenes] == id(group_active);
+            return std::string(current ? "current" : "press to apply");
+          # The in-use colour when the hint names the row in use, as on the row itself.
+          text_color: !lambda |-
+            const auto &sk = id(scene_keys);
+            const auto &gn = id(group_names);
+            const int i = id(picker_index);
+            const int scenes = (int) sk.size();
+            if (i >= 0 && i < scenes && sk[i] == id(scene_last)) {
+              return lv_color_hex(0x60A5FA);
+            }
+            if (id(sys_state) != STATE_GLM_LOCKED && i >= scenes && i - scenes < (int) gn.size() &&
+                gn[i - scenes] == id(group_active)) {
+              return lv_color_hex(0x00C080);
+            }
+            return lv_color_hex(0x8A8A8A);

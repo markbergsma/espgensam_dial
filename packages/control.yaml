@@ -72,6 +72,35 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  # Scene display names in the order the transport delivers them, and parallel to them the keys
+  # handed back to target_activate_scene. Control never interprets a key. Empty means no scene rows.
+  - id: scene_names
+    type: std::vector<std::string>
+    restore_value: false
+  - id: scene_keys
+    type: std::vector<std::string>
+    restore_value: false
+  - id: scene_last # key of the last applied scene; "" when unknown
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # Private to the transport: bookkeeping for the scene query. See target_refresh_scenes.
+  - id: scenes_known # a scene list has arrived at least once, even an empty one
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: scene_query_sent_ms # a query awaiting its reply; 0 = none
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: scene_query_stalled # a query went unanswered; no more until the API reconnects
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: scene_query_again # a refresh was asked for while a query was in flight
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
   # --- Owned by control / UI ----------------------------------------------------------------
   - id: vol_sent # last value handed to the transport
@@ -124,6 +153,15 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # The picker button's label and whether it names a scene, formatted once per repaint so the
+  # label text and border colour agree. See ui_refresh.
+  - id: ui_picker_text
+    type: std::string
+    restore_value: false
+  - id: ui_picker_scene
+    type: bool
+    restore_value: false
+    initial_value: "false"
   - id: refused_until_ms # amber "write refused" pulse expiry
     type: uint32_t
     restore_value: false
@@ -132,10 +170,16 @@ globals:
     type: int
     restore_value: false
     initial_value: "0" # UI_VOLUME
-  - id: picker_index # highlighted row of the group picker; meaningful only while it is open
+  - id: picker_index # highlighted row of the picker; meaningful only while it is open
     type: int
     restore_value: false
     initial_value: "0"
+  # The highlighted row's picker_row_key(), so a list that changes underneath keeps the highlight
+  # on the same item. Kept in step with picker_index by every script that moves it.
+  - id: picker_key
+    type: std::string
+    restore_value: false
+    initial_value: '""'
   # Tracks the last backlight script run, so a tap on a dimmed screen can just wake it.
   - id: backlight_dimmed
     type: bool
@@ -189,7 +233,7 @@ script:
       dir: int
     then:
       - lambda: |-
-          if (id(ui_mode) == UI_GROUP_PICKER) {
+          if (id(ui_mode) == UI_PICKER) {
             id(picker_turned)->execute(dir);
           } else {
             id(dial_turned)->execute(dir);
@@ -401,16 +445,21 @@ script:
                   - rtttl.play: "tick:d=64,o=7,b=220:c"
 
   # ---------------------------------------------------------------------------------------------
-  # Group picker.
+  # Picker: Home Assistant scenes, then espgensam group presets, in one list.
   #
-  # Opened by a tap on the group button, driven by the knob, confirmed by a short press. Nothing is sent until that
-  # press, because applying a group is not cheap: espgensam pushes routing, crossover, level,
-  # delay and EQ to every monitor and ducks the volume while it does. Browsing past a group must
-  # never apply it.
+  # Opened by a tap on the picker button, driven by the knob, confirmed by a short press. Nothing is
+  # sent until that press. Applying either kind of row is not cheap: a scene can change a whole
+  # room, and a group makes espgensam push routing, crossover, level, delay and EQ to every monitor,
+  # ducking the volume while it does. Browsing past a row must never apply it.
   #
-  # Accepted in the same states as mute and power. espgensam also accepts a choice made in standby,
-  # while waking or with no monitors online: it holds the request and pushes it at the next
-  # discovery, where it takes precedence over re-applying the previous group.
+  # The rows are picker_row_key()'s layout (include/dial_state.h): scene_keys, then group_names.
+  # Scenes and groups confirm differently; the UiMode comment there says why.
+  #
+  # Group rows are accepted in the same states as mute and power. espgensam also accepts a choice
+  # made in standby, while waking or with no monitors online: it holds the request and pushes it
+  # at the next discovery, where it takes precedence over re-applying the previous group. Scene
+  # rows are accepted while GLM owns the bus as well, since Home Assistant is still there to act
+  # on them.
   # ---------------------------------------------------------------------------------------------
   - id: picker_open
     then:
@@ -425,23 +474,32 @@ script:
             - if:
                 condition:
                   lambda: |-
-                    return !id(group_names).empty() && id(sys_state) != STATE_DISCONNECTED &&
-                           id(sys_state) != STATE_GLM_LOCKED;
+                    const int s = id(sys_state);
+                    return s != STATE_DISCONNECTED &&
+                           (!id(scene_keys).empty() ||
+                            (!id(group_names).empty() && s != STATE_GLM_LOCKED));
                 then:
                   - lambda: |-
-                      // Start on the group in use, so an accidental press re-selects it — which
-                      // picker_confirm treats as a no-op.
-                      id(picker_index) = 0;
-                      const auto &names = id(group_names);
-                      for (size_t i = 0; i < names.size(); i++) {
-                        if (names[i] == id(group_active)) {
-                          id(picker_index) = (int) i;
-                          break;
-                        }
+                      // Start on what is in use: the last applied scene, else the active group.
+                      // An accidental press then re-applies that scene (restoring the room to
+                      // what it was last set to) or is a no-op on the group.
+                      const auto &sk = id(scene_keys);
+                      const auto &gn = id(group_names);
+                      int i = -1;
+                      if (!id(scene_last).empty()) {
+                        i = picker_find_row(sk, gn, "s:" + id(scene_last));
                       }
-                      id(ui_mode) = UI_GROUP_PICKER;
+                      if (i < 0 && !id(group_active).empty()) {
+                        i = picker_find_row(sk, gn, "g:" + id(group_active));
+                      }
+                      id(picker_index) = std::max(i, 0);
+                      id(picker_key) = picker_row_key(sk, gn, id(picker_index));
+                      id(ui_mode) = UI_PICKER;
                   - script.execute: picker_show
                   - script.execute: picker_timeout
+                  # Picks up scenes added, removed or applied elsewhere since the last query. The
+                  # list shown meanwhile is the cached one; on_scenes_changed updates it in place.
+                  - script.execute: target_refresh_scenes
                 else:
                   - lambda: |-
                       id(refused_until_ms) = millis() + 700;
@@ -454,10 +512,13 @@ script:
       dir: int
     then:
       - lambda: |-
-          const int last = std::max((int) id(group_names).size() - 1, 0);
+          const auto &sk = id(scene_keys);
+          const auto &gn = id(group_names);
+          const int last = std::max((int) (sk.size() + gn.size()) - 1, 0);
           const int next = std::min(std::max(id(picker_index) + dir, 0), last);
           id(at_limit_edge) = (next != id(picker_index)) && (next == 0 || next == last);
           id(picker_index) = next;
+          id(picker_key) = picker_row_key(sk, gn, next);
       - script.execute: wake_backlight
       - script.execute: picker_repaint
       - script.execute: feedback_tick
@@ -466,23 +527,24 @@ script:
   - id: picker_confirm
     then:
       - script.execute: wake_backlight
-      - if:
-          condition:
-            lambda: |-
-              return id(picker_index) >= 0 &&
-                     id(picker_index) < (int) id(group_names).size() &&
-                     id(sys_state) != STATE_DISCONNECTED && id(sys_state) != STATE_GLM_LOCKED;
-          then:
-            - lambda: |-
-                // Confirming the group already in use closes the picker without a write. A
-                // re-push would duck the volume for nothing.
-                const std::string name = id(group_names)[id(picker_index)];
-                if (name != id(group_active)) {
-                  id(target_set_group)->execute(name);
-                }
-          else:
-            - lambda: |-
-                id(refused_until_ms) = millis() + 700;
+      - lambda: |-
+          const int i = id(picker_index);
+          const int scenes = (int) id(scene_keys).size();
+          const int s = id(sys_state);
+          if (s != STATE_DISCONNECTED && i >= 0 && i < scenes) {
+            // Always applied, even when it is the last applied scene.
+            id(target_activate_scene)->execute(id(scene_keys)[i]);
+          } else if (s != STATE_DISCONNECTED && s != STATE_GLM_LOCKED && i >= scenes &&
+                     i - scenes < (int) id(group_names).size()) {
+            // Confirming the group already in use closes the picker without a write. A re-push
+            // would duck the volume for nothing.
+            const std::string name = id(group_names)[i - scenes];
+            if (name != id(group_active)) {
+              id(target_set_group)->execute(name);
+            }
+          } else {
+            id(refused_until_ms) = millis() + 700;
+          }
       - script.execute: picker_close
 
   - id: picker_close
@@ -500,26 +562,43 @@ script:
       - delay: ${picker_timeout}
       - if:
           condition:
-            lambda: "return id(ui_mode) == UI_GROUP_PICKER;"
+            lambda: "return id(ui_mode) == UI_PICKER;"
           then:
             - script.execute: picker_close
 
   # Invoked by the transport whenever it (re)delivers group_names.
   - id: on_groups_changed
     then:
+      - script.execute: picker_items_changed
+
+  # Invoked by the transport whenever it (re)delivers scene_names, scene_keys or scene_last.
+  - id: on_scenes_changed
+    then:
+      - script.execute: picker_items_changed
+
+  # Keeps an open picker on the same item, by key, when either list changes underneath it. If that
+  # item has gone, the highlight stays at its index, clamped to the new length.
+  - id: picker_items_changed
+    then:
       - if:
           condition:
-            lambda: "return id(ui_mode) == UI_GROUP_PICKER;"
+            lambda: "return id(ui_mode) == UI_PICKER;"
           then:
             - if:
                 condition:
-                  lambda: "return id(group_names).empty();"
+                  lambda: "return id(scene_keys).empty() && id(group_names).empty();"
                 then:
                   - script.execute: picker_close
                 else:
                   - lambda: |-
-                      id(picker_index) =
-                          std::min(id(picker_index), (int) id(group_names).size() - 1);
+                      const auto &sk = id(scene_keys);
+                      const auto &gn = id(group_names);
+                      int i = picker_find_row(sk, gn, id(picker_key));
+                      if (i < 0) {
+                        i = std::min(id(picker_index), (int) (sk.size() + gn.size()) - 1);
+                      }
+                      id(picker_index) = i;
+                      id(picker_key) = picker_row_key(sk, gn, i);
                   - script.execute: picker_populate
       - script.execute: ui_refresh
 
@@ -576,18 +655,22 @@ interval:
             id(ui_refresh)->execute();
           }
           was_refusing = refusing;
-      # Close the picker when the system stops accepting a choice while it is open. Polled here
-      # rather than hooked into derive_state, which belongs to the transport.
+      # Close the picker when the system stops accepting a choice while it is open: always on
+      # losing the link, and on GLM taking the bus only when there are no scene rows to offer (group
+      # rows then refuse on their own). Polled here rather than hooked into derive_state, which
+      # belongs to the transport.
       - if:
           condition:
             lambda: |-
-              return id(ui_mode) == UI_GROUP_PICKER &&
-                     (id(sys_state) == STATE_DISCONNECTED || id(sys_state) == STATE_GLM_LOCKED);
+              const int s = id(sys_state);
+              return id(ui_mode) == UI_PICKER &&
+                     (s == STATE_DISCONNECTED ||
+                      (s == STATE_GLM_LOCKED && id(scene_keys).empty()));
           then:
             - script.execute: picker_close
 
 binary_sensor:
-  # In the group picker a long press cancels rather than powering the system: a user who has
+  # In the picker a long press cancels rather than powering the system: a user who has
   # opened a menu is not reaching for the power switch, and must not get it by holding too long.
   - id: !extend front_button
     on_multi_click:
@@ -596,7 +679,7 @@ binary_sensor:
           - OFF for at least 30ms
         then:
           - lambda: |-
-              if (id(ui_mode) == UI_GROUP_PICKER) {
+              if (id(ui_mode) == UI_PICKER) {
                 id(picker_confirm)->execute();
               } else {
                 id(dial_pressed)->execute();
@@ -605,7 +688,7 @@ binary_sensor:
           - ON for at least 800ms
         then:
           - lambda: |-
-              if (id(ui_mode) == UI_GROUP_PICKER) {
+              if (id(ui_mode) == UI_PICKER) {
                 id(picker_close)->execute();
               } else {
                 id(dial_held)->execute();

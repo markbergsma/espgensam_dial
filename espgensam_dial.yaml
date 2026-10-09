@@ -29,8 +29,23 @@ substitutions:
   ent_bus_status: "sensor.genelec_sam_controller_bus_status"
   # Optional. espgensam only has this select when its config declares `groups:` (or `sam_file:`)
   # together with `group_select: name: "Group Preset"`; its committed config does neither. If the
-  # entity never reports, the dial simply has no group picker.
+  # entity never reports, the picker simply has no group rows.
   ent_group: "select.genelec_sam_controller_group_preset"
+
+  # ---------------------------------------------------------------------------------------------
+  # Home Assistant scenes.
+  #
+  # The picker offers every scene carrying this Home Assistant label, ahead of the group presets.
+  # Not an entity id: the list is looked up by Home Assistant itself (see target_refresh_scenes in
+  # the transport), so labelling or unlabelling a scene changes the picker without a reflash.
+  # Empty disables scenes, and the dial then never asks.
+  # ---------------------------------------------------------------------------------------------
+  scene_label: "dial"
+  # How often the scene list is asked for again, besides at connect and every time the picker
+  # opens. This is only what catches a scene applied elsewhere for the picker button, which shows
+  # the last applied scene. Each query is one round trip through Home Assistant and nothing on the
+  # bus.
+  scene_refresh: "60min"
 
   # ---------------------------------------------------------------------------------------------
   # Knob feel: accelerated 0.5 dB steps.
@@ -72,9 +87,12 @@ substitutions:
   # Which value is the large number: "db" or "percent". The other one appears small underneath
   # only while the knob is turning, and disappears secondary_hold ms after the last detent.
   primary_readout: "db"
+  # What the picker button names: "scene" (the last applied scene) or "group" (the active group
+  # preset). Either way the picker offers both. When the chosen one is unknown the other stands in.
+  picker_button_shows: "scene"
   secondary_hold: "1500"
   idle_timeout: "20s"
-  # The group picker closes by itself after this long without input, so a dial put down with the
+  # The picker closes by itself after this long without input, so a dial put down with the
   # picker open goes back to being a volume knob. Long enough to read a handful of names and turn
   # to one; the idle dim (above) is longer, so the picker never sits on a dimmed screen.
   picker_timeout: "8s"
@@ -98,7 +116,7 @@ packages:
   target: !include packages/target_espgensam_ha.yaml
   control: !include packages/control.yaml
   ui: !include packages/ui_volume.yaml
-  ui_group: !include packages/ui_group.yaml
+  ui_picker: !include packages/ui_picker.yaml
 
 wifi:
   ssid: !secret wifi_ssid
@@ -108,7 +126,8 @@ wifi:
 
 captive_portal:
 
-# ArduinoJson, used by the transport to decode the group list. See ha_group_options there.
+# ArduinoJson, used by the transport to decode the group list (see ha_group_options there) and the
+# scene query's response.
 json:
 
 logger:
